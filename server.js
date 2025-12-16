@@ -70,6 +70,9 @@ async function processMessageQueue() {
 }
 
 function initializeWhatsApp() {
+  console.log("[v0] Initializing WhatsApp client...")
+  console.log("[v0] Chromium path:", process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium")
+
   whatsappClient = new Client({
     authStrategy: new LocalAuth({
       dataPath: "./whatsapp_sessions",
@@ -77,6 +80,7 @@ function initializeWhatsApp() {
     }),
     puppeteer: {
       headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -90,6 +94,8 @@ function initializeWhatsApp() {
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process",
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
       ],
       timeout: 60000,
@@ -99,34 +105,35 @@ function initializeWhatsApp() {
       remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
     },
     qrMaxRetries: 5,
-    takeoverOnConflict: false, // Evitar conflitos de sessão
+    takeoverOnConflict: false,
     takeoverTimeoutMs: 0,
   })
 
   whatsappClient.on("qr", async (qr) => {
-    console.log("[WhatsApp] QR Code received, generating...")
+    console.log("[v0] QR Code received! Generating data URL...")
     try {
       qrCodeData = await qrcode.toDataURL(qr)
       io.emit("qr", qrCodeData)
-      console.log("[WhatsApp] QR Code emitted to clients")
+      console.log("[v0] QR Code emitted to all connected clients via Socket.IO")
+      console.log("[v0] QR Code length:", qrCodeData.length, "characters")
     } catch (error) {
-      console.error("[WhatsApp] Error generating QR code:", error)
+      console.error("[v0] ERROR generating QR code:", error)
     }
   })
 
   whatsappClient.on("loading_screen", (percent, message) => {
-    console.log(`[WhatsApp] Loading: ${percent}% - ${message}`)
+    console.log(`[v0] Loading: ${percent}% - ${message}`)
     io.emit("loading", { percent, message })
   })
 
   whatsappClient.on("authenticated", () => {
-    console.log("[WhatsApp] Authenticated successfully")
+    console.log("[v0] Authenticated successfully!")
     reconnectAttempts = 0
     io.emit("authenticated", { success: true })
   })
 
   whatsappClient.on("ready", async () => {
-    console.log("[WhatsApp] Client is ready!")
+    console.log("[v0] WhatsApp Client is READY!")
     isConnected = true
     qrCodeData = null
     io.emit("ready", { connected: true })
@@ -135,20 +142,20 @@ function initializeWhatsApp() {
       const conn = await mysql.createConnection(dbConfig)
       await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", ["connected"])
       await conn.end()
-      console.log("[WhatsApp] Database updated: connected")
+      console.log("[v0] Database updated: CONNECTED")
     } catch (error) {
-      console.error("[WhatsApp] Error updating database:", error)
+      console.error("[v0] Error updating database:", error)
     }
   })
 
   whatsappClient.on("auth_failure", (msg) => {
-    console.error("[WhatsApp] Authentication failure:", msg)
+    console.error("[v0] Authentication FAILURE:", msg)
     isConnected = false
     io.emit("auth_failure", { message: msg })
   })
 
   whatsappClient.on("disconnected", async (reason) => {
-    console.log("[WhatsApp] Disconnected:", reason)
+    console.log("[v0] Disconnected:", reason)
     isConnected = false
     qrCodeData = null
     io.emit("disconnected", { reason })
@@ -158,25 +165,23 @@ function initializeWhatsApp() {
       await conn.execute("UPDATE whatsapp_config SET status = ? WHERE id = 1", ["disconnected"])
       await conn.end()
     } catch (error) {
-      console.error("[WhatsApp] Error updating database:", error)
+      console.error("[v0] Error updating database:", error)
     }
 
     if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && reason !== "LOGOUT") {
       reconnectAttempts++
       const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000)
-      console.log(
-        `[WhatsApp] Attempting reconnection ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay / 1000}s...`,
-      )
+      console.log(`[v0] Attempting reconnection ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay / 1000}s...`)
 
       setTimeout(() => {
-        console.log("[WhatsApp] Reinitializing client...")
+        console.log("[v0] Reinitializing client...")
         initializeWhatsApp()
       }, delay)
     }
   })
 
   whatsappClient.on("change_state", (state) => {
-    console.log("[WhatsApp] State changed:", state)
+    console.log("[v0] State changed:", state)
   })
 
   whatsappClient.on("message", async (message) => {
@@ -214,16 +219,16 @@ function initializeWhatsApp() {
 
       await conn.end()
     } catch (error) {
-      console.error("[WhatsApp] Error handling message:", error)
+      console.error("[v0] Error handling message:", error)
     }
   })
 
   whatsappClient.on("error", (error) => {
-    console.error("[WhatsApp] Client error:", error)
+    console.error("[v0] Client ERROR:", error)
     io.emit("error", { message: error.message })
   })
 
-  console.log("[WhatsApp] Initializing client...")
+  console.log("[v0] Starting WhatsApp client initialization...")
   whatsappClient.initialize()
 }
 
@@ -246,11 +251,14 @@ app.get("/api/status", (req, res) => {
 })
 
 app.post("/api/connect", (req, res) => {
+  console.log("[v0] POST /api/connect received")
   if (!whatsappClient || !isConnected) {
     reconnectAttempts = 0
+    console.log("[v0] Starting WhatsApp connection...")
     initializeWhatsApp()
     res.json({ success: true, message: "Connecting to WhatsApp..." })
   } else {
+    console.log("[v0] Already connected!")
     res.json({ success: false, message: "Already connected" })
   }
 })
@@ -370,7 +378,6 @@ app.post("/api/send-message", async (req, res) => {
 
     await sendPromise
 
-    // Save to database
     const conn = await mysql.createConnection(dbConfig)
     await conn.execute(
       `INSERT INTO whatsapp_messages 
@@ -463,7 +470,7 @@ app.get("/", (req, res) => {
 })
 
 io.on("connection", (socket) => {
-  console.log("[Socket.IO] Client connected:", socket.id)
+  console.log("[v0] Socket.IO client connected:", socket.id)
 
   socket.emit("status", {
     connected: isConnected,
@@ -472,7 +479,7 @@ io.on("connection", (socket) => {
   })
 
   socket.on("disconnect", () => {
-    console.log("[Socket.IO] Client disconnected:", socket.id)
+    console.log("[v0] Socket.IO client disconnected:", socket.id)
   })
 })
 
