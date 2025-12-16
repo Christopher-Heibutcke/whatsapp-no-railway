@@ -42,6 +42,7 @@ const dbConfig = {
 let whatsappClient = null
 let qrCodeData = null
 let isConnected = false
+let isClientReady = false
 let reconnectAttempts = 0
 const MAX_RECONNECT_ATTEMPTS = 5
 
@@ -177,7 +178,13 @@ function initializeWhatsApp() {
     console.log("[v0] ========================================")
     isConnected = true
     qrCodeData = null
-    io.emit("ready", { connected: true })
+
+    console.log("[v0] Waiting for WhatsApp to fully initialize...")
+    setTimeout(() => {
+      isClientReady = true
+      console.log("[v0] Client is now FULLY READY for operations")
+      io.emit("ready", { connected: true })
+    }, 3000)
 
     try {
       const conn = await mysql.createConnection(dbConfig)
@@ -198,6 +205,7 @@ function initializeWhatsApp() {
   whatsappClient.on("disconnected", async (reason) => {
     console.log("[v0] Disconnected:", reason)
     isConnected = false
+    isClientReady = false
     qrCodeData = null
     io.emit("disconnected", { reason })
 
@@ -296,6 +304,7 @@ app.get("/api/ping", (req, res) => {
 app.get("/api/status", (req, res) => {
   res.json({
     connected: isConnected,
+    clientReady: isClientReady,
     qrCode: qrCodeData,
     reconnectAttempts: reconnectAttempts,
   })
@@ -330,6 +339,7 @@ app.post("/api/disconnect", async (req, res) => {
       await whatsappClient.destroy()
       whatsappClient = null
       isConnected = false
+      isClientReady = false
       qrCodeData = null
       reconnectAttempts = 0
 
@@ -348,12 +358,28 @@ app.post("/api/disconnect", async (req, res) => {
 })
 
 app.get("/api/chats", async (req, res) => {
+  console.log("[v0] ========================================")
+  console.log("[v0] GET /api/chats requested")
+  console.log("[v0] isConnected:", isConnected)
+  console.log("[v0] isClientReady:", isClientReady)
+  console.log("[v0] whatsappClient exists:", !!whatsappClient)
+  console.log("[v0] ========================================")
+
   try {
     if (!isConnected || !whatsappClient) {
+      console.log("[v0] WhatsApp not connected - returning error")
       return res.json({ success: false, message: "WhatsApp not connected" })
     }
 
+    if (!isClientReady) {
+      console.log("[v0] Client not fully ready yet - returning error")
+      return res.json({ success: false, message: "WhatsApp is connecting, please wait..." })
+    }
+
+    console.log("[v0] Fetching chats from WhatsApp...")
     const chats = await whatsappClient.getChats()
+    console.log("[v0] Total chats received:", chats.length)
+
     const chatList = await Promise.all(
       chats.slice(0, 50).map(async (chat) => {
         try {
@@ -373,15 +399,23 @@ app.get("/api/chats", async (req, res) => {
               : null,
           }
         } catch (error) {
-          console.error("[API] Error processing chat:", error)
+          console.error("[v0] Error processing individual chat:", error.message)
           return null
         }
       }),
     )
 
-    res.json({ success: true, chats: chatList.filter((c) => c !== null) })
+    const filteredChats = chatList.filter((c) => c !== null)
+    console.log("[v0] Processed chats successfully:", filteredChats.length)
+    console.log("[v0] ========================================")
+
+    res.json({ success: true, chats: filteredChats })
   } catch (error) {
-    console.error("[API] Error getting chats:", error)
+    console.error("[v0] ========================================")
+    console.error("[v0] ERROR in /api/chats:")
+    console.error("[v0] Message:", error.message)
+    console.error("[v0] Stack:", error.stack)
+    console.error("[v0] ========================================")
     res.json({ success: false, message: error.message })
   }
 })
@@ -535,6 +569,7 @@ io.on("connection", (socket) => {
 
   socket.emit("status", {
     connected: isConnected,
+    clientReady: isClientReady,
     qrCode: qrCodeData,
     reconnectAttempts: reconnectAttempts,
   })
