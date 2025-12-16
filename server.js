@@ -5,6 +5,7 @@ const cors = require("cors")
 const mysql = require("mysql2/promise")
 const http = require("http")
 const socketIo = require("socket.io")
+const fs = require("fs")
 
 const app = express()
 const server = http.createServer(app)
@@ -71,7 +72,26 @@ async function processMessageQueue() {
 
 function initializeWhatsApp() {
   console.log("[v0] Initializing WhatsApp client...")
-  console.log("[v0] Chromium path:", process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium")
+
+  const possiblePaths = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+  ]
+
+  let chromiumPath = "/usr/bin/chromium"
+
+  for (const path of possiblePaths) {
+    if (path && fs.existsSync(path)) {
+      chromiumPath = path
+      console.log("[v0] Found Chromium at:", chromiumPath)
+      break
+    }
+  }
+
+  console.log("[v0] Using Chromium path:", chromiumPath)
 
   whatsappClient = new Client({
     authStrategy: new LocalAuth({
@@ -80,7 +100,7 @@ function initializeWhatsApp() {
     }),
     puppeteer: {
       headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
+      executablePath: chromiumPath,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
