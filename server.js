@@ -71,27 +71,41 @@ async function processMessageQueue() {
 }
 
 function initializeWhatsApp() {
-  console.log("[v0] Initializing WhatsApp client...")
+  console.log("[v0] Starting WhatsApp client initialization...")
 
   const possiblePaths = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
     "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium-browser",
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_BIN,
   ]
 
-  let chromiumPath = "/usr/bin/chromium"
+  let chromiumPath = null
 
+  console.log("[v0] Searching for Chromium in the following paths:")
   for (const path of possiblePaths) {
-    if (path && fs.existsSync(path)) {
-      chromiumPath = path
-      console.log("[v0] Found Chromium at:", chromiumPath)
-      break
+    if (path) {
+      console.log(`[v0]   Checking: ${path}`)
+      if (fs.existsSync(path)) {
+        chromiumPath = path
+        console.log(`[v0]   ✓ FOUND at: ${chromiumPath}`)
+        break
+      } else {
+        console.log(`[v0]   ✗ Not found`)
+      }
     }
   }
 
-  console.log("[v0] Using Chromium path:", chromiumPath)
+  if (!chromiumPath) {
+    console.error("[v0] ERROR: Chromium not found in any expected location!")
+    console.error("[v0] Please ensure Chromium is installed in the container.")
+    throw new Error("Chromium executable not found")
+  }
+
+  console.log("[v0] Initializing WhatsApp client...")
+  console.log(`[v0] Chromium path: ${chromiumPath}`)
 
   whatsappClient = new Client({
     authStrategy: new LocalAuth({
