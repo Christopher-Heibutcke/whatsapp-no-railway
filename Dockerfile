@@ -1,7 +1,6 @@
-# Use Node.js 18 with Debian base for better compatibility
 FROM node:18-bullseye-slim
 
-# Install dependencies for Chromium and Puppeteer
+# Install Chromium and all required dependencies
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-sandbox \
@@ -33,27 +32,28 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-RUN which chromium > /tmp/chromium_path.txt && \
-    cat /tmp/chromium_path.txt && \
-    ln -s $(which chromium) /usr/bin/google-chrome || true
+RUN ln -sf /usr/bin/chromium /usr/bin/google-chrome && \
+    ln -sf /usr/bin/chromium /usr/bin/google-chrome-stable && \
+    ln -sf /usr/bin/chromium /usr/bin/chromium-browser
+
+RUN which chromium && \
+    ls -la /usr/bin/chromium && \
+    ls -la /usr/bin/google-chrome && \
+    chromium --version
 
 # Set environment variables for Puppeteer
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV CHROME_BIN=/usr/bin/chromium
 
-# Set working directory
 WORKDIR /app
 
-# Copy package files
 COPY package*.json ./
 
-RUN npm install
+RUN npm install --production
 
-# Copy application code
 COPY . .
 
-# Create directory for WhatsApp sessions with proper permissions
 RUN mkdir -p whatsapp_sessions && chmod 777 whatsapp_sessions
 
 RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
@@ -61,15 +61,11 @@ RUN groupadd -r pptruser && useradd -r -g pptruser -G audio,video pptruser \
     && chown -R pptruser:pptruser /home/pptruser \
     && chown -R pptruser:pptruser /app
 
-# Run as non-root user
 USER pptruser
 
-# Expose port
 EXPOSE 3000
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
   CMD node -e "require('http').get('http://localhost:3000/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"
 
-# Start the application
 CMD ["npm", "start"]
