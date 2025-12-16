@@ -114,10 +114,6 @@ function initializeWhatsApp() {
       dataPath: "./whatsapp_sessions",
       clientId: "eyescloud-main",
     }),
-    webVersionCache: {
-      type: "remote",
-      remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
-    },
     puppeteer: {
       headless: true,
       executablePath: chromiumPath,
@@ -179,12 +175,15 @@ function initializeWhatsApp() {
     isConnected = true
     qrCodeData = null
 
-    console.log("[v0] Waiting for WhatsApp to fully initialize...")
+    console.log("[v0] Waiting 5 seconds for WhatsApp to fully synchronize...")
     setTimeout(() => {
       isClientReady = true
-      console.log("[v0] Client is now FULLY READY for operations")
-      io.emit("ready", { connected: true })
-    }, 3000)
+      console.log("[v0] ========================================")
+      console.log("[v0] CLIENT IS NOW FULLY READY FOR ALL OPERATIONS")
+      console.log("[v0] You can now load chats and send messages")
+      console.log("[v0] ========================================")
+      io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
+    }, 5000)
 
     try {
       const conn = await mysql.createConnection(dbConfig)
