@@ -1,27 +1,33 @@
-# Use imagem oficial do Puppeteer que ja vem com Chromium
-FROM ghcr.io/puppeteer/puppeteer:21.6.1
+FROM node:18-slim
 
-# Definir variaveis de ambiente
+RUN apt-get update && apt-get install -y \
+    chromium \
+    chromium-sandbox \
+    fonts-ipafont-gothic \
+    fonts-wqy-zenhei \
+    fonts-thai-tlwg \
+    fonts-kacst \
+    fonts-freefont-ttf \
+    libxss1 \
+    libxtst6 \
+    ca-certificates \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     NODE_ENV=production
 
-# Definir diretorio de trabalho
 WORKDIR /usr/src/app
 
-# Copiar package.json e package-lock.json (se existir)
 COPY package*.json ./
 
-RUN npm install --production
+RUN npm install --production --legacy-peer-deps
 
-# Copiar todo o codigo do projeto
 COPY . .
 
-# Criar pasta de sessoes do WhatsApp com permissoes corretas
 RUN mkdir -p whatsapp_sessions && chmod 777 whatsapp_sessions
 
-# Expor porta 3000
 EXPOSE 3000
 
-# Comando para iniciar o servidor
 CMD ["node", "server.js"]
