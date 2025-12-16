@@ -1,0 +1,12 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+README.md
+.env
+.DS_Store
+whatsapp_sessions
+*.md
+INSTALACAO_COMPLETA.md
+RAILWAY_DEPLOY.md
+WhatsAppAPI.php
