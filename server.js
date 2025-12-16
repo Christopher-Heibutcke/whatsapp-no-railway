@@ -71,41 +71,42 @@ async function processMessageQueue() {
 }
 
 function initializeWhatsApp() {
+  console.log("[v0] ========================================")
   console.log("[v0] Starting WhatsApp client initialization...")
+  console.log("[v0] ========================================")
 
   const possiblePaths = [
     "/usr/bin/chromium",
-    "/usr/bin/google-chrome",
     "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
     "/usr/bin/chromium-browser",
     process.env.PUPPETEER_EXECUTABLE_PATH,
-    process.env.CHROME_BIN,
-  ]
+  ].filter(Boolean)
 
   let chromiumPath = null
 
-  console.log("[v0] Searching for Chromium in the following paths:")
+  console.log("[v0] Searching for Chromium executable...")
   for (const path of possiblePaths) {
-    if (path) {
-      console.log(`[v0]   Checking: ${path}`)
-      if (fs.existsSync(path)) {
-        chromiumPath = path
-        console.log(`[v0]   ✓ FOUND at: ${chromiumPath}`)
-        break
-      } else {
-        console.log(`[v0]   ✗ Not found`)
-      }
+    console.log(`[v0]   Checking: ${path}`)
+    if (fs.existsSync(path)) {
+      chromiumPath = path
+      console.log(`[v0]   ✓ FOUND: ${chromiumPath}`)
+      break
     }
   }
 
   if (!chromiumPath) {
-    console.error("[v0] ERROR: Chromium not found in any expected location!")
-    console.error("[v0] Please ensure Chromium is installed in the container.")
+    console.error("[v0] ========================================")
+    console.error("[v0] ERROR: Chromium not found!")
+    console.error("[v0] Checked paths:", possiblePaths)
+    console.error("[v0] ========================================")
     throw new Error("Chromium executable not found")
   }
 
-  console.log("[v0] Initializing WhatsApp client...")
-  console.log(`[v0] Chromium path: ${chromiumPath}`)
+  console.log("[v0] ========================================")
+  console.log("[v0] Initializing WhatsApp Client...")
+  console.log(`[v0] Chromium: ${chromiumPath}`)
+  console.log("[v0] ========================================")
 
   whatsappClient = new Client({
     authStrategy: new LocalAuth({
@@ -127,21 +128,29 @@ function initializeWhatsApp() {
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process",
       ],
     },
-    qrMaxRetries: 5,
   })
 
   whatsappClient.on("qr", async (qr) => {
-    console.log("[v0] QR Code received! Generating data URL...")
+    console.log("[v0] ========================================")
+    console.log("[v0] QR CODE RECEIVED!")
+    console.log("[v0] ========================================")
+    console.log("[v0] QR Code string length:", qr.length)
+
     try {
       qrCodeData = await qrcode.toDataURL(qr)
+      console.log("[v0] QR Code converted to Data URL")
+      console.log("[v0] Data URL length:", qrCodeData.length)
+
       io.emit("qr", qrCodeData)
-      console.log("[v0] QR Code emitted to all connected clients via Socket.IO")
-      console.log("[v0] QR Code length:", qrCodeData.length, "characters")
+      console.log("[v0] QR Code emitted via Socket.IO to all clients")
+      console.log("[v0] ========================================")
     } catch (error) {
       console.error("[v0] ERROR generating QR code:", error)
+      console.error("[v0] ========================================")
     }
   })
 
@@ -151,13 +160,17 @@ function initializeWhatsApp() {
   })
 
   whatsappClient.on("authenticated", () => {
-    console.log("[v0] Authenticated successfully!")
+    console.log("[v0] ========================================")
+    console.log("[v0] AUTHENTICATED SUCCESSFULLY!")
+    console.log("[v0] ========================================")
     reconnectAttempts = 0
     io.emit("authenticated", { success: true })
   })
 
   whatsappClient.on("ready", async () => {
-    console.log("[v0] WhatsApp Client is READY!")
+    console.log("[v0] ========================================")
+    console.log("[v0] WHATSAPP CLIENT IS READY!")
+    console.log("[v0] ========================================")
     isConnected = true
     qrCodeData = null
     io.emit("ready", { connected: true })
@@ -248,12 +261,22 @@ function initializeWhatsApp() {
   })
 
   whatsappClient.on("error", (error) => {
-    console.error("[v0] Client ERROR:", error)
+    console.error("[v0] ========================================")
+    console.error("[v0] CLIENT ERROR:")
+    console.error("[v0]", error.message)
+    console.error("[v0] Stack:", error.stack)
+    console.error("[v0] ========================================")
     io.emit("error", { message: error.message })
   })
 
-  console.log("[v0] Starting WhatsApp client initialization...")
-  whatsappClient.initialize()
+  console.log("[v0] Starting client initialization...")
+  whatsappClient.initialize().catch((err) => {
+    console.error("[v0] ========================================")
+    console.error("[v0] INITIALIZATION ERROR:")
+    console.error("[v0]", err.message)
+    console.error("[v0] Stack:", err.stack)
+    console.error("[v0] ========================================")
+  })
 }
 
 // API Routes
@@ -275,12 +298,22 @@ app.get("/api/status", (req, res) => {
 })
 
 app.post("/api/connect", (req, res) => {
+  console.log("[v0] ========================================")
   console.log("[v0] POST /api/connect received")
+  console.log("[v0] Current status - Connected:", isConnected)
+  console.log("[v0] Current status - Client exists:", !!whatsappClient)
+  console.log("[v0] ========================================")
+
   if (!whatsappClient || !isConnected) {
     reconnectAttempts = 0
     console.log("[v0] Starting WhatsApp connection...")
-    initializeWhatsApp()
-    res.json({ success: true, message: "Connecting to WhatsApp..." })
+    try {
+      initializeWhatsApp()
+      res.json({ success: true, message: "Connecting to WhatsApp..." })
+    } catch (error) {
+      console.error("[v0] Error starting connection:", error)
+      res.json({ success: false, message: error.message })
+    }
   } else {
     console.log("[v0] Already connected!")
     res.json({ success: false, message: "Already connected" })
