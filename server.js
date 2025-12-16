@@ -169,9 +169,12 @@ function initializeWhatsApp() {
 
     console.log("[v0] Waiting 3 seconds for initial sync...")
     setTimeout(() => {
+      isConnected = true
       isClientReady = true
       console.log("[v0] ========================================")
-      console.log("[v0] CLIENT MARKED AS READY AFTER AUTHENTICATION")
+      console.log("[v0] CLIENT MARKED AS READY AND CONNECTED")
+      console.log("[v0] isConnected:", isConnected)
+      console.log("[v0] isClientReady:", isClientReady)
       console.log("[v0] ========================================")
       io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
     }, 3000)
