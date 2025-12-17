@@ -167,20 +167,22 @@ function initializeWhatsApp() {
     reconnectAttempts = 0
     io.emit("authenticated", { success: true })
 
-    console.log("[v0] Waiting 5 seconds for WhatsApp Store to initialize...")
+    console.log("[v0] Waiting for WhatsApp Store to initialize...")
     setTimeout(async () => {
-      if (whatsappClient && typeof whatsappClient.getChats === "function") {
+      const storeReady = await waitForStoreToLoad()
+
+      if (storeReady) {
         isConnected = true
         isClientReady = true
         console.log("[v0] ========================================")
         console.log("[v0] CLIENT MARKED AS READY AFTER AUTHENTICATION")
-        console.log("[v0] getChats verification: PASSED")
+        console.log("[v0] Store verification: PASSED")
         console.log("[v0] ========================================")
         io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
       } else {
-        console.log("[v0] WARNING: getChats not available yet, waiting for ready event...")
+        console.log("[v0] Store failed to load, waiting for ready event...")
       }
-    }, 5000)
+    }, 5000) // Wait 5 seconds before starting verification
   })
 
   whatsappClient.on("ready", async () => {
@@ -188,15 +190,15 @@ function initializeWhatsApp() {
     console.log("[v0] WHATSAPP CLIENT IS READY!")
     console.log("[v0] ========================================")
 
-    console.log("[v0] Waiting 10 more seconds to ensure Store.Chat is loaded...")
-    setTimeout(async () => {
+    const storeReady = await waitForStoreToLoad()
+
+    if (storeReady) {
       isConnected = true
       isClientReady = true
       qrCodeData = null
 
       console.log("[v0] ========================================")
-      console.log("[v0] STORE SHOULD BE FULLY LOADED NOW")
-      console.log("[v0] Emitting ready event to frontend...")
+      console.log("[v0] STORE FULLY LOADED - EMITTING READY EVENT")
       console.log("[v0] ========================================")
 
       io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
@@ -209,7 +211,10 @@ function initializeWhatsApp() {
       } catch (error) {
         console.error("[v0] Error updating database:", error)
       }
-    }, 10000)
+    } else {
+      console.error("[v0] Failed to verify Store is loaded after ready event")
+      isClientReady = false
+    }
   })
 
   whatsappClient.on("auth_failure", (msg) => {
@@ -656,3 +661,40 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`[Server] Database: ${dbConfig.database}@${dbConfig.host}`)
   console.log("=".repeat(50))
 })
+
+async function waitForStoreToLoad() {
+  console.log("[v0] ========================================")
+  console.log("[v0] Actively checking if Store.Chat is loaded...")
+  console.log("[v0] ========================================")
+
+  let attempts = 0
+  const maxAttempts = 30 // 30 seconds max
+
+  while (attempts < maxAttempts) {
+    try {
+      if (whatsappClient && typeof whatsappClient.getChats === "function") {
+        // Try to actually call getChats to verify Store is loaded
+        console.log(`[v0] Attempt ${attempts + 1}: Testing getChats()...`)
+        const testChats = await whatsappClient.getChats()
+
+        if (testChats && Array.isArray(testChats)) {
+          console.log("[v0] ========================================")
+          console.log("[v0] SUCCESS! Store.Chat is fully loaded")
+          console.log(`[v0] Found ${testChats.length} chats`)
+          console.log("[v0] ========================================")
+          return true
+        }
+      }
+    } catch (error) {
+      console.log(`[v0] Attempt ${attempts + 1} failed: ${error.message}`)
+    }
+
+    attempts++
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+
+  console.error("[v0] ========================================")
+  console.error("[v0] ERROR: Store.Chat failed to load after 30 seconds")
+  console.error("[v0] ========================================")
+  return false
+}
