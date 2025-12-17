@@ -580,7 +580,6 @@ app.get("/api/chats", async (req, res) => {
   try {
     log("info", "Fetching chats...")
 
-    // Timeout de 60 segundos para getChats
     const getChatsPromise = whatsappClient.getChats()
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error("Timeout getting chats")), 60000),
@@ -590,52 +589,61 @@ app.get("/api/chats", async (req, res) => {
 
     log("info", `Retrieved ${chats.length} chats, processing...`)
 
-    // Processar apenas os primeiros 50 chats
     const processedChats = []
     const chatsToProcess = chats.slice(0, 50)
 
     for (const chat of chatsToProcess) {
       try {
         let contactName = chat.name
+        let profilePic = null
 
-        if (!contactName) {
-          try {
+        try {
+          if (!chat.isGroup) {
             const contact = await chat.getContact()
-            contactName = contact.pushname || contact.number || chat.id.user
-          } catch {
-            contactName = chat.id.user || "Unknown"
+            contactName = contact.pushname || contact.name || contact.number || chat.name
+            profilePic = await contact.getProfilePicUrl()
+          } else {
+            profilePic = await chat.getProfilePicUrl()
+          }
+        } catch (picError) {
+          // Profile pic not available, continue without it
+        }
+
+        let lastMessage = null
+        if (chat.lastMessage) {
+          lastMessage = {
+            body: chat.lastMessage.body || "",
+            timestamp: chat.lastMessage.timestamp,
+            fromMe: chat.lastMessage.fromMe,
+            hasMedia: chat.lastMessage.hasMedia,
+            type: chat.lastMessage.type,
           }
         }
 
         processedChats.push({
           id: chat.id._serialized,
-          name: contactName,
+          name: contactName || chat.id.user,
           isGroup: chat.isGroup,
           unreadCount: chat.unreadCount || 0,
-          timestamp: chat.timestamp || 0,
-          lastMessage: chat.lastMessage
-            ? {
-                body: chat.lastMessage.body || "",
-                timestamp: chat.lastMessage.timestamp || 0,
-                fromMe: chat.lastMessage.fromMe || false,
-              }
-            : null,
+          timestamp: chat.timestamp || (chat.lastMessage ? chat.lastMessage.timestamp : 0),
+          lastMessage: lastMessage,
+          profilePic: profilePic,
         })
       } catch (chatError) {
         log("warn", `Error processing chat ${chat.id._serialized}:`, chatError.message)
-        // Adicionar mesmo com erro, com dados básicos
         processedChats.push({
           id: chat.id._serialized,
-          name: chat.name || chat.id.user || "Unknown",
-          isGroup: chat.isGroup || false,
+          name: chat.name || chat.id.user,
+          isGroup: chat.isGroup,
           unreadCount: 0,
           timestamp: 0,
           lastMessage: null,
+          profilePic: null,
         })
       }
     }
 
-    // Ordenar por timestamp (mais recentes primeiro)
+    // Sort by timestamp (most recent first)
     processedChats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
 
     log("info", `Returning ${processedChats.length} processed chats`)
@@ -644,27 +652,9 @@ app.get("/api/chats", async (req, res) => {
       success: true,
       chats: processedChats,
       total: chats.length,
-      processed: processedChats.length,
     })
   } catch (error) {
-    log("error", "========================================")
-    log("error", "ERROR fetching chats:", error.message)
-    log("error", "========================================")
-
-    // Verificar se é erro de Store não pronto
-    if (
-      error.message.includes("Cannot read properties") ||
-      error.message.includes("undefined") ||
-      error.message.includes("Timeout")
-    ) {
-      return res.json({
-        success: false,
-        message: "WhatsApp is still loading. Please wait 30-60 seconds and try again.",
-        error: error.message,
-        chats: [],
-      })
-    }
-
+    log("error", "Error in /api/chats:", error.message)
     res.json({
       success: false,
       message: error.message,
@@ -678,52 +668,51 @@ app.get("/api/messages/:chatId", async (req, res) => {
   const { chatId } = req.params
   const limit = Number.parseInt(req.query.limit) || 50
 
-  log("info", `GET /api/messages/${chatId} (limit: ${limit})`)
+  log("info", `GET /api/messages/${chatId}`)
 
   if (!whatsappClient || !isClientReady) {
-    // Tentar buscar do banco de dados
-    try {
-      const conn = await mysql.createConnection(dbConfig)
-      const [messages] = await conn.execute(
-        `SELECT * FROM whatsapp_messages 
-                WHERE chat_id = ? 
-                ORDER BY timestamp DESC 
-                LIMIT ?`,
-        [chatId, limit],
-      )
-      await conn.end()
-
-      return res.json({
-        success: true,
-        messages: messages.reverse(),
-        source: "database",
-      })
-    } catch (dbError) {
-      return res.json({
-        success: false,
-        message: "WhatsApp not connected and database unavailable",
-        messages: [],
-      })
-    }
+    return res.json({
+      success: false,
+      message: "WhatsApp not ready",
+      messages: [],
+    })
   }
 
   try {
     const chat = await whatsappClient.getChatById(chatId)
     const messages = await chat.fetchMessages({ limit })
 
-    const messageList = messages.map((msg) => ({
-      id: msg.id._serialized,
-      body: msg.body,
-      fromMe: msg.fromMe,
-      timestamp: msg.timestamp,
-      type: msg.type,
-      hasMedia: msg.hasMedia,
-    }))
+    const processedMessages = []
+
+    for (const msg of messages) {
+      let mediaUrl = null
+
+      if (msg.hasMedia) {
+        try {
+          const media = await msg.downloadMedia()
+          if (media) {
+            mediaUrl = `data:${media.mimetype};base64,${media.data}`
+          }
+        } catch (mediaError) {
+          log("warn", "Could not download media:", mediaError.message)
+        }
+      }
+
+      processedMessages.push({
+        id: msg.id._serialized,
+        body: msg.body,
+        fromMe: msg.fromMe,
+        timestamp: msg.timestamp,
+        type: msg.type,
+        hasMedia: msg.hasMedia,
+        mediaUrl: mediaUrl,
+        ack: msg.ack,
+      })
+    }
 
     res.json({
       success: true,
-      messages: messageList,
-      source: "whatsapp",
+      messages: processedMessages,
     })
   } catch (error) {
     log("error", "Error fetching messages:", error.message)
@@ -783,47 +772,43 @@ app.post("/api/send", async (req, res) => {
 
 // Enviar mídia
 app.post("/api/send-media", async (req, res) => {
-  const { number, chatId, mediaUrl, caption, mimetype } = req.body
+  const { chatId, media, filename, mimetype, funcionarioId, funcionarioNome } = req.body
 
-  log("info", `POST /api/send-media to ${number || chatId}`)
+  log("info", `POST /api/send-media to ${chatId}`)
 
   if (!whatsappClient || !isClientReady) {
     return res.json({
       success: false,
-      message: "WhatsApp not connected",
+      message: "WhatsApp not ready",
     })
   }
 
   try {
-    let targetId = chatId
+    // Extract base64 data
+    const base64Data = media.split(",")[1]
 
-    if (!targetId && number) {
-      const cleanNumber = number.replace(/\D/g, "")
-      targetId = cleanNumber.includes("@") ? cleanNumber : `${cleanNumber}@c.us`
+    const messageMedia = new MessageMedia(mimetype, base64Data, filename)
+
+    await whatsappClient.sendMessage(chatId, messageMedia)
+
+    // Save to database
+    try {
+      const conn = await mysql.createConnection(dbConfig)
+      await conn.execute(
+        `INSERT INTO whatsapp_messages 
+        (chat_id, message_text, message_type, is_from_me, timestamp, funcionario_id, funcionario_nome) 
+        VALUES (?, ?, ?, 1, NOW(), ?, ?)`,
+        [chatId, `[Mídia: ${filename}]`, mimetype.split("/")[0], funcionarioId, funcionarioNome],
+      )
+      await conn.end()
+    } catch (dbError) {
+      log("warn", "Error saving media message to database:", dbError.message)
     }
 
-    const media = await MessageMedia.fromUrl(mediaUrl, {
-      unsafeMime: true,
-    })
-
-    if (mimetype) {
-      media.mimetype = mimetype
-    }
-
-    const result = await whatsappClient.sendMessage(targetId, media, {
-      caption: caption || "",
-    })
-
-    res.json({
-      success: true,
-      messageId: result.id._serialized,
-    })
+    res.json({ success: true, message: "Media sent successfully" })
   } catch (error) {
     log("error", "Error sending media:", error.message)
-    res.json({
-      success: false,
-      message: error.message,
-    })
+    res.json({ success: false, message: error.message })
   }
 })
 
