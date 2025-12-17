@@ -167,22 +167,21 @@ function initializeWhatsApp() {
     reconnectAttempts = 0
     io.emit("authenticated", { success: true })
 
-    console.log("[v0] Waiting for WhatsApp Store to initialize...")
-    setTimeout(async () => {
-      const storeReady = await waitForStoreToLoad()
+    console.log("[v0] Waiting for ready event to confirm WhatsApp is fully loaded...")
 
-      if (storeReady) {
+    setTimeout(() => {
+      if (!isClientReady && !isConnected) {
+        console.log("[v0] ========================================")
+        console.log("[v0] WARNING: Ready event not received after 45 seconds")
+        console.log("[v0] Forcing ready state...")
+        console.log("[v0] ========================================")
         isConnected = true
         isClientReady = true
-        console.log("[v0] ========================================")
-        console.log("[v0] CLIENT MARKED AS READY AFTER AUTHENTICATION")
-        console.log("[v0] Store verification: PASSED")
-        console.log("[v0] ========================================")
-        io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
-      } else {
-        console.log("[v0] Store failed to load, waiting for ready event...")
+        qrCodeData = null
+        io.emit("ready", { connected: true, timestamp: new Date().toISOString(), forced: true })
+        io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString(), forced: true })
       }
-    }, 5000) // Wait 5 seconds before starting verification
+    }, 45000)
   })
 
   whatsappClient.on("ready", async () => {
@@ -190,31 +189,26 @@ function initializeWhatsApp() {
     console.log("[v0] WHATSAPP CLIENT IS READY!")
     console.log("[v0] ========================================")
 
-    const storeReady = await waitForStoreToLoad()
+    isConnected = true
+    isClientReady = true
+    qrCodeData = null
 
-    if (storeReady) {
-      isConnected = true
-      isClientReady = true
-      qrCodeData = null
+    console.log("[v0] Emitting ready events to frontend...")
+    io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
+    io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
 
-      console.log("[v0] ========================================")
-      console.log("[v0] STORE FULLY LOADED - EMITTING READY EVENT")
-      console.log("[v0] ========================================")
-
-      io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
-
-      try {
-        const conn = await mysql.createConnection(dbConfig)
-        await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", ["connected"])
-        await conn.end()
-        console.log("[v0] Database updated: CONNECTED")
-      } catch (error) {
-        console.error("[v0] Error updating database:", error)
-      }
-    } else {
-      console.error("[v0] Failed to verify Store is loaded after ready event")
-      isClientReady = false
+    try {
+      const conn = await mysql.createConnection(dbConfig)
+      await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", ["connected"])
+      await conn.end()
+      console.log("[v0] Database updated: CONNECTED")
+    } catch (error) {
+      console.error("[v0] Error updating database:", error)
     }
+
+    console.log("[v0] ========================================")
+    console.log("[v0] CLIENT FULLY READY - Frontend can now load chats")
+    console.log("[v0] ========================================")
   })
 
   whatsappClient.on("auth_failure", (msg) => {
@@ -384,7 +378,6 @@ app.get("/api/chats", async (req, res) => {
   console.log("[v0] isConnected:", isConnected)
   console.log("[v0] isClientReady:", isClientReady)
   console.log("[v0] whatsappClient exists:", !!whatsappClient)
-  console.log("[v0] whatsappClient.getChats exists:", whatsappClient ? typeof whatsappClient.getChats : "N/A")
   console.log("[v0] ========================================")
 
   try {
@@ -395,15 +388,7 @@ app.get("/api/chats", async (req, res) => {
 
     if (!isClientReady) {
       console.log("[v0] Client not fully ready yet - returning error")
-      return res.json({ success: false, message: "WhatsApp is still initializing, please wait 10-15 seconds..." })
-    }
-
-    if (!whatsappClient.getChats || typeof whatsappClient.getChats !== "function") {
-      console.error("[v0] getChats method not available on client")
-      return res.json({
-        success: false,
-        message: "WhatsApp Store not fully loaded yet. Please wait 10 more seconds and try again.",
-      })
+      return res.json({ success: false, message: "WhatsApp is still initializing, please wait..." })
     }
 
     console.log("[v0] All checks passed, fetching chats...")
@@ -411,24 +396,30 @@ app.get("/api/chats", async (req, res) => {
 
     let chats
     try {
-      chats = await whatsappClient.getChats()
+      const getChatsPromise = whatsappClient.getChats()
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("getChats timeout after 15 seconds")), 15000),
+      )
+
+      chats = await Promise.race([getChatsPromise, timeoutPromise])
       console.log("[v0] getChats() successful! Total chats:", chats.length)
     } catch (getChatsError) {
       console.error("[v0] ========================================")
       console.error("[v0] ERROR IN getChats():")
       console.error("[v0] Message:", getChatsError.message)
-      console.error("[v0] Stack:", getChatsError.stack)
       console.error("[v0] ========================================")
 
-      if (getChatsError.message.includes("Cannot read properties of undefined")) {
-        isClientReady = false
+      if (
+        getChatsError.message.includes("Cannot read properties of undefined") ||
+        getChatsError.message.includes("timeout")
+      ) {
         return res.json({
           success: false,
-          message: "WhatsApp Store not loaded. Please disconnect and reconnect WhatsApp.",
+          message: "WhatsApp Store is still loading. Please wait 15-30 seconds and refresh the page.",
         })
       }
 
-      throw getChatsError
+      return res.json({ success: false, message: getChatsError.message })
     }
 
     const chatList = await Promise.all(
@@ -661,40 +652,3 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`[Server] Database: ${dbConfig.database}@${dbConfig.host}`)
   console.log("=".repeat(50))
 })
-
-async function waitForStoreToLoad() {
-  console.log("[v0] ========================================")
-  console.log("[v0] Actively checking if Store.Chat is loaded...")
-  console.log("[v0] ========================================")
-
-  let attempts = 0
-  const maxAttempts = 30 // 30 seconds max
-
-  while (attempts < maxAttempts) {
-    try {
-      if (whatsappClient && typeof whatsappClient.getChats === "function") {
-        // Try to actually call getChats to verify Store is loaded
-        console.log(`[v0] Attempt ${attempts + 1}: Testing getChats()...`)
-        const testChats = await whatsappClient.getChats()
-
-        if (testChats && Array.isArray(testChats)) {
-          console.log("[v0] ========================================")
-          console.log("[v0] SUCCESS! Store.Chat is fully loaded")
-          console.log(`[v0] Found ${testChats.length} chats`)
-          console.log("[v0] ========================================")
-          return true
-        }
-      }
-    } catch (error) {
-      console.log(`[v0] Attempt ${attempts + 1} failed: ${error.message}`)
-    }
-
-    attempts++
-    await new Promise((resolve) => setTimeout(resolve, 1000))
-  }
-
-  console.error("[v0] ========================================")
-  console.error("[v0] ERROR: Store.Chat failed to load after 30 seconds")
-  console.error("[v0] ========================================")
-  return false
-}
