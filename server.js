@@ -1,207 +1,192 @@
-const express = require("express")
-const { Client, LocalAuth } = require("whatsapp-web.js")
-const qrcode = require("qrcode")
-const cors = require("cors")
-const mysql = require("mysql2/promise")
-const http = require("http")
-const socketIo = require("socket.io")
-const fs = require("fs")
+const express = require("express");
+const { Client, LocalAuth } = require("whatsapp-web.js");
+const qrcode = require("qrcode");
+const cors = require("cors");
+const mysql = require("mysql2/promise");
+const http = require("http");
+const socketIo = require("socket.io");
+const fs = require("fs");
 
-const app = express()
-const server = http.createServer(app)
-
+const app = express();
+const server = http.createServer(app);
 const io = socketIo(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-})
+  cors: { origin: "*", methods: ["GET", "POST"] }
+});
 
-app.use(cors({ origin: "*", credentials: true }))
-app.use(express.json())
+app.use(cors());
+app.use(express.json());
 
-/* ================= DATABASE ================= */
-
+/* ===================== DATABASE ===================== */
 const dbConfig = {
-  host: process.env.DB_HOST || "localhost",
-  user: process.env.DB_USER || "u517535970_eyesclound",
-  password: process.env.DB_PASSWORD || "SENHA_AQUI",
-  database: process.env.DB_NAME || "u517535970_eyesclound",
-}
+  host: "localhost",
+  user: "u517535970_eyesclound",
+  password: "LDZV2eR2k$",
+  database: "u517535970_eyesclound",
+};
 
-/* ================= GLOBAL STATE ================= */
+/* ===================== STATE ===================== */
+let client = null;
+let qrCodeData = null;
+let isConnected = false;
+let isReady = false;
 
-let whatsappClient = null
-let qrCodeData = null
-let isConnected = false
-let isClientReady = false
-let chatsSynced = false
-let reconnectAttempts = 0
-const MAX_RECONNECT_ATTEMPTS = 5
+/* ===================== INIT WHATSAPP ===================== */
+async function initWhatsApp() {
+  if (client) {
+    console.log("[WA] Client already exists");
+    return;
+  }
 
-/* ================= WHATSAPP INIT ================= */
+  console.log("[WA] Initializing WhatsApp...");
 
-function initializeWhatsApp() {
-  const chromiumPaths = [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-  ].filter(Boolean)
-
-  const chromiumPath = chromiumPaths.find(p => fs.existsSync(p))
-  if (!chromiumPath) throw new Error("Chromium não encontrado")
-
-  whatsappClient = new Client({
+  client = new Client({
     authStrategy: new LocalAuth({
-      dataPath: "./whatsapp_sessions",
-      clientId: "eyescloud-main",
+      dataPath: "./sessions",
+      clientId: "eyescloud"
     }),
     puppeteer: {
-      headless: true,
-      executablePath: chromiumPath,
+      headless: "new",
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-web-security",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--window-size=1280,800",
-      ],
-    },
-  })
-
-  /* ================= EVENTS ================= */
-
-  whatsappClient.on("qr", async (qr) => {
-    qrCodeData = await qrcode.toDataURL(qr)
-    io.emit("qr", qrCodeData)
-  })
-
-  whatsappClient.on("authenticated", () => {
-    console.log("[WA] Authenticated")
-  })
-
-  whatsappClient.on("ready", async () => {
-    console.log("[WA] Ready – aguardando sync dos chats")
-
-    isConnected = true
-    chatsSynced = false
-    isClientReady = false
-
-    const start = Date.now()
-    const timeout = 60000
-
-    while (Date.now() - start < timeout) {
-      try {
-        const chats = await whatsappClient.getChats()
-        if (Array.isArray(chats)) {
-          chatsSynced = true
-          isClientReady = true
-          console.log(`[WA] Chats sincronizados: ${chats.length}`)
-          break
-        }
-      } catch (e) {}
-
-      await new Promise(r => setTimeout(r, 2000))
+        "--disable-gpu"
+      ]
     }
+  });
 
-    if (!chatsSynced) {
-      console.error("[WA] Timeout ao sincronizar chats")
+  /* ---------- QR ---------- */
+  client.on("qr", async (qr) => {
+    qrCodeData = await qrcode.toDataURL(qr);
+    io.emit("qr", qrCodeData);
+    console.log("[WA] QR RECEIVED");
+  });
+
+  /* ---------- AUTH ---------- */
+  client.on("authenticated", () => {
+    console.log("[WA] AUTHENTICATED");
+  });
+
+  /* ---------- READY (ÚNICO PONTO DE CONEXÃO REAL) ---------- */
+  client.on("ready", async () => {
+    console.log("[WA] READY ✔");
+    isConnected = true;
+    isReady = true;
+    qrCodeData = null;
+
+    io.emit("ready", { connected: true });
+
+    try {
+      const conn = await mysql.createConnection(dbConfig);
+      await conn.execute(
+        "UPDATE whatsapp_config SET status='connected', last_connected=NOW() WHERE id=1"
+      );
+      await conn.end();
+    } catch (e) {
+      console.error("[DB] Error updating status", e.message);
     }
+  });
 
-    io.emit("ready", {
-      connected: isConnected,
-      clientReady: isClientReady,
-      chatsSynced,
-    })
-  })
+  /* ---------- DISCONNECT ---------- */
+  client.on("disconnected", async (reason) => {
+    console.log("[WA] DISCONNECTED:", reason);
+    isConnected = false;
+    isReady = false;
+    qrCodeData = null;
 
-  whatsappClient.on("disconnected", (reason) => {
-    console.log("[WA] Disconnected:", reason)
-    isConnected = false
-    isClientReady = false
-    chatsSynced = false
-    qrCodeData = null
+    io.emit("disconnected", reason);
 
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      reconnectAttempts++
-      setTimeout(initializeWhatsApp, 5000)
-    }
-  })
+    try {
+      await client.destroy();
+    } catch {}
+    client = null;
+  });
 
-  whatsappClient.initialize()
+  client.initialize();
 }
 
-/* ================= API ================= */
+/* ===================== ROUTES ===================== */
+app.post("/api/connect", async (_, res) => {
+  await initWhatsApp();
+  res.json({ success: true });
+});
 
-app.get("/api/status", (req, res) => {
+app.get("/api/status", (_, res) => {
   res.json({
     connected: isConnected,
-    clientReady: isClientReady,
-    chatsSynced,
-    qrCode: qrCodeData,
-  })
-})
+    ready: isReady,
+    qrCode: qrCodeData
+  });
+});
 
-app.post("/api/connect", (req, res) => {
-  if (!whatsappClient) {
-    initializeWhatsApp()
-    return res.json({ success: true, message: "Conectando..." })
+/* ===================== CHATS ===================== */
+app.get("/api/chats", async (_, res) => {
+  if (!client || !isReady) {
+    return res.json({ success: false, message: "WhatsApp not ready" });
   }
-  res.json({ success: false, message: "Já conectado" })
-})
 
-app.get("/api/chats", async (req, res) => {
-  if (!isConnected || !isClientReady || !chatsSynced) {
-    return res.json({
-      success: false,
-      message: "WhatsApp ainda sincronizando conversas",
+  const chats = await client.getChats();
+
+  const data = await Promise.all(
+    chats.slice(0, 50).map(async (chat) => {
+      const contact = await chat.getContact();
+      return {
+        id: chat.id._serialized,
+        name: chat.name || contact.pushname || contact.number,
+        unread: chat.unreadCount,
+        lastMessage: chat.lastMessage?.body || ""
+      };
     })
+  );
+
+  res.json({ success: true, chats: data });
+});
+
+/* ===================== MESSAGES ===================== */
+app.get("/api/messages/:chatId", async (req, res) => {
+  if (!client || !isReady) {
+    return res.json({ success: false });
   }
 
-  try {
-    const chats = await whatsappClient.getChats()
+  const chat = await client.getChatById(req.params.chatId);
+  const msgs = await chat.fetchMessages({ limit: 50 });
 
-    const result = await Promise.all(
-      chats.slice(0, 50).map(async (chat) => {
-        const contact = await chat.getContact()
-        return {
-          id: chat.id._serialized,
-          name: chat.name || contact.pushname || contact.number,
-          isGroup: chat.isGroup,
-          unreadCount: chat.unreadCount,
-          lastMessage: chat.lastMessage
-            ? {
-                body: chat.lastMessage.body,
-                timestamp: chat.lastMessage.timestamp,
-              }
-            : null,
-        }
-      })
-    )
+  res.json({
+    success: true,
+    messages: msgs.map((m) => ({
+      id: m.id._serialized,
+      body: m.body,
+      fromMe: m.fromMe,
+      timestamp: m.timestamp
+    }))
+  });
+});
 
-    res.json({ success: true, chats: result })
-  } catch (err) {
-    res.json({ success: false, message: err.message })
+/* ===================== SEND ===================== */
+app.post("/api/send-message", async (req, res) => {
+  if (!client || !isReady) {
+    return res.json({ success: false });
   }
-})
 
-/* ================= SOCKET ================= */
+  const { chatId, message } = req.body;
+  await client.sendMessage(chatId, message);
+  res.json({ success: true });
+});
 
+/* ===================== SOCKET ===================== */
 io.on("connection", (socket) => {
   socket.emit("status", {
     connected: isConnected,
-    clientReady: isClientReady,
-    chatsSynced,
-    qrCode: qrCodeData,
-  })
-})
+    ready: isReady,
+    qrCode: qrCodeData
+  });
+});
 
-/* ================= SERVER ================= */
-
-const PORT = process.env.PORT || 3000
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("==========================================")
-  console.log(" EyesCloud WhatsApp API v2.0")
-  console.log(" Port:", PORT)
-  console.log("==========================================")
-})
+/* ===================== START ===================== */
+const PORT = 3000;
+server.listen(PORT, () => {
+  console.log("====================================");
+  console.log(" EyesCloud WhatsApp API - ONLINE");
+  console.log(" PORT:", PORT);
+  console.log("====================================");
+});
