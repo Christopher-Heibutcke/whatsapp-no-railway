@@ -812,6 +812,120 @@ app.post("/api/send-media", async (req, res) => {
   }
 })
 
+// Obter respostas rápidas
+app.get("/api/quick-replies", async (req, res) => {
+  log("info", "GET /api/quick-replies")
+
+  try {
+    const conn = await mysql.createConnection(dbConfig)
+    const [rows] = await conn.execute(
+      "SELECT id, titulo, mensagem, categoria FROM whatsapp_quick_replies WHERE ativo = 1 ORDER BY ordem ASC",
+    )
+    await conn.end()
+
+    res.json({
+      success: true,
+      replies: rows,
+    })
+  } catch (error) {
+    log("error", "Error fetching quick replies:", error.message)
+    // Return empty array instead of error to avoid frontend crashes
+    res.json({
+      success: true,
+      replies: [],
+    })
+  }
+})
+
+// Obter foto de perfil
+app.get("/api/profile-pic/:chatId", async (req, res) => {
+  const { chatId } = req.params
+
+  if (!whatsappClient || !isClientReady) {
+    return res.json({
+      success: false,
+      profilePic: null,
+    })
+  }
+
+  try {
+    let profilePic = null
+
+    if (chatId.includes("@g.us")) {
+      // Group chat
+      const chat = await whatsappClient.getChatById(chatId)
+      profilePic = await chat.getProfilePicUrl()
+    } else {
+      // Individual contact
+      const contact = await whatsappClient.getContactById(chatId)
+      profilePic = await contact.getProfilePicUrl()
+    }
+
+    res.json({
+      success: true,
+      profilePic: profilePic || null,
+    })
+  } catch (error) {
+    res.json({
+      success: false,
+      profilePic: null,
+    })
+  }
+})
+
+// Obter mídia de uma mensagem
+app.get("/api/media/:messageId", async (req, res) => {
+  const { messageId } = req.params
+
+  log("info", `GET /api/media/${messageId}`)
+
+  if (!whatsappClient || !isClientReady) {
+    return res.json({
+      success: false,
+      message: "WhatsApp not ready",
+    })
+  }
+
+  try {
+    // Find the message in recent chats
+    const chats = await whatsappClient.getChats()
+
+    for (const chat of chats.slice(0, 20)) {
+      try {
+        const messages = await chat.fetchMessages({ limit: 30 })
+        const targetMsg = messages.find((m) => m.id._serialized === messageId)
+
+        if (targetMsg && targetMsg.hasMedia) {
+          const media = await targetMsg.downloadMedia()
+          if (media) {
+            return res.json({
+              success: true,
+              media: {
+                mimetype: media.mimetype,
+                data: media.data,
+                filename: media.filename,
+              },
+            })
+          }
+        }
+      } catch (e) {
+        // Continue to next chat
+      }
+    }
+
+    res.json({
+      success: false,
+      message: "Media not found",
+    })
+  } catch (error) {
+    log("error", "Error fetching media:", error.message)
+    res.json({
+      success: false,
+      message: error.message,
+    })
+  }
+})
+
 // ============================================
 // SOCKET.IO
 // ============================================
