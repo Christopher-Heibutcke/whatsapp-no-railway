@@ -167,27 +167,25 @@ function initializeWhatsApp() {
     reconnectAttempts = 0
     io.emit("authenticated", { success: true })
 
-    console.log("[v0] Waiting for ready event...")
-    console.log("[v0] ========================================")
+    console.log("[v0] Waiting 3 seconds for initial sync...")
+    setTimeout(() => {
+      isClientReady = true
+      console.log("[v0] ========================================")
+      console.log("[v0] CLIENT MARKED AS READY AFTER AUTHENTICATION")
+      console.log("[v0] ========================================")
+      io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
+    }, 3000)
   })
 
   whatsappClient.on("ready", async () => {
     console.log("[v0] ========================================")
     console.log("[v0] WHATSAPP CLIENT IS READY!")
     console.log("[v0] ========================================")
-
-    qrCodeData = null
     isConnected = true
-    isClientReady = true // Marcar como ready imediatamente
+    qrCodeData = null
+    isClientReady = true
 
     io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
-    io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
-
-    console.log("[v0] ========================================")
-    console.log("[v0] Eventos emitidos - Frontend notificado")
-    console.log("[v0] isConnected:", isConnected)
-    console.log("[v0] isClientReady:", isClientReady)
-    console.log("[v0] ========================================")
 
     try {
       const conn = await mysql.createConnection(dbConfig)
