@@ -166,38 +166,41 @@ function initializeWhatsApp() {
     console.log("[v0] ========================================")
     reconnectAttempts = 0
     io.emit("authenticated", { success: true })
-
-    console.log("[v0] Waiting 3 seconds for initial sync...")
-    setTimeout(() => {
-      isConnected = true
-      isClientReady = true
-      console.log("[v0] ========================================")
-      console.log("[v0] CLIENT MARKED AS READY AND CONNECTED")
-      console.log("[v0] isConnected:", isConnected)
-      console.log("[v0] isClientReady:", isClientReady)
-      console.log("[v0] ========================================")
-      io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
-    }, 3000)
+    console.log("[v0] Waiting for 'ready' event to complete initialization...")
   })
 
   whatsappClient.on("ready", async () => {
     console.log("[v0] ========================================")
     console.log("[v0] WHATSAPP CLIENT IS READY!")
     console.log("[v0] ========================================")
-    isConnected = true
+
     qrCodeData = null
-    isClientReady = true
 
-    io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
+    console.log("[v0] Aguardando 5 segundos para sincronização completa...")
 
-    try {
-      const conn = await mysql.createConnection(dbConfig)
-      await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", ["connected"])
-      await conn.end()
-      console.log("[v0] Database updated: CONNECTED")
-    } catch (error) {
-      console.error("[v0] Error updating database:", error)
-    }
+    setTimeout(async () => {
+      isConnected = true
+      isClientReady = true
+
+      console.log("[v0] ========================================")
+      console.log("[v0] CLIENT FULLY READY - Status atualizado")
+      console.log("[v0] isConnected:", isConnected)
+      console.log("[v0] isClientReady:", isClientReady)
+      console.log("[v0] whatsappClient.getChats exists:", typeof whatsappClient.getChats)
+      console.log("[v0] ========================================")
+
+      io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
+      io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
+
+      try {
+        const conn = await mysql.createConnection(dbConfig)
+        await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", ["connected"])
+        await conn.end()
+        console.log("[v0] Database updated: CONNECTED")
+      } catch (error) {
+        console.error("[v0] Error updating database:", error)
+      }
+    }, 5000)
   })
 
   whatsappClient.on("auth_failure", (msg) => {
@@ -367,6 +370,7 @@ app.get("/api/chats", async (req, res) => {
   console.log("[v0] isConnected:", isConnected)
   console.log("[v0] isClientReady:", isClientReady)
   console.log("[v0] whatsappClient exists:", !!whatsappClient)
+  console.log("[v0] whatsappClient.getChats exists:", whatsappClient ? typeof whatsappClient.getChats : "N/A")
   console.log("[v0] ========================================")
 
   try {
@@ -378,6 +382,11 @@ app.get("/api/chats", async (req, res) => {
     if (!isClientReady) {
       console.log("[v0] Client not fully ready yet - returning error")
       return res.json({ success: false, message: "WhatsApp is connecting, please wait..." })
+    }
+
+    if (!whatsappClient.getChats || typeof whatsappClient.getChats !== "function") {
+      console.error("[v0] getChats method not available on client")
+      return res.json({ success: false, message: "WhatsApp client not fully initialized, please wait and try again" })
     }
 
     console.log("[v0] Fetching chats from WhatsApp...")
