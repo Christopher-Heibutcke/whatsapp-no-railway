@@ -167,37 +167,40 @@ function initializeWhatsApp() {
     reconnectAttempts = 0
     io.emit("authenticated", { success: true })
 
-    console.log("[v0] Waiting 3 seconds for initial sync...")
-    setTimeout(() => {
-      isConnected = true
-      isClientReady = true
-      console.log("[v0] ========================================")
-      console.log("[v0] CLIENT MARKED AS READY AND CONNECTED")
-      console.log("[v0] isConnected:", isConnected)
-      console.log("[v0] isClientReady:", isClientReady)
-      console.log("[v0] ========================================")
-      io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
-    }, 3000)
+    console.log("[v0] Waiting for ready event...")
+    console.log("[v0] ========================================")
   })
 
   whatsappClient.on("ready", async () => {
     console.log("[v0] ========================================")
     console.log("[v0] WHATSAPP CLIENT IS READY!")
     console.log("[v0] ========================================")
-    isConnected = true
+
     qrCodeData = null
-    isClientReady = true
 
-    io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
+    console.log("[v0] Waiting 15 seconds for WhatsApp Store to fully load...")
+    setTimeout(async () => {
+      isConnected = true
+      isClientReady = true
 
-    try {
-      const conn = await mysql.createConnection(dbConfig)
-      await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", ["connected"])
-      await conn.end()
-      console.log("[v0] Database updated: CONNECTED")
-    } catch (error) {
-      console.error("[v0] Error updating database:", error)
-    }
+      console.log("[v0] ========================================")
+      console.log("[v0] CLIENT FULLY READY - Store loaded")
+      console.log("[v0] isConnected:", isConnected)
+      console.log("[v0] isClientReady:", isClientReady)
+      console.log("[v0] ========================================")
+
+      io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
+      io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
+
+      try {
+        const conn = await mysql.createConnection(dbConfig)
+        await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", ["connected"])
+        await conn.end()
+        console.log("[v0] Database updated: CONNECTED")
+      } catch (error) {
+        console.error("[v0] Error updating database:", error)
+      }
+    }, 15000) // Aumentado para 15 segundos
   })
 
   whatsappClient.on("auth_failure", (msg) => {
