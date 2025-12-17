@@ -1,3 +1,10 @@
+/**
+ * EyesCloud WhatsApp Backend v2.5.0
+ * Servidor completo para integração WhatsApp Web
+ *
+ * REESCRITO COMPLETAMENTE para garantir funcionamento
+ */
+
 const express = require("express")
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js")
 const qrcode = require("qrcode")
@@ -6,6 +13,11 @@ const mysql = require("mysql2/promise")
 const http = require("http")
 const socketIo = require("socket.io")
 const fs = require("fs")
+const path = require("path")
+
+// ============================================
+// CONFIGURAÇÃO DO SERVIDOR
+// ============================================
 
 const app = express()
 const server = http.createServer(app)
@@ -18,6 +30,8 @@ const io = socketIo(server, {
   },
   transports: ["websocket", "polling"],
   allowEIO3: true,
+  pingTimeout: 60000,
+  pingInterval: 25000,
 })
 
 app.use(
@@ -26,7 +40,12 @@ app.use(
     credentials: true,
   }),
 )
-app.use(express.json())
+app.use(express.json({ limit: "50mb" }))
+app.use(express.urlencoded({ extended: true, limit: "50mb" }))
+
+// ============================================
+// CONFIGURAÇÃO DO BANCO DE DADOS
+// ============================================
 
 const dbConfig = {
   host: process.env.DB_HOST || "localhost",
@@ -39,174 +58,129 @@ const dbConfig = {
   connectTimeout: 30000,
 }
 
+// ============================================
+// VARIÁVEIS DE ESTADO GLOBAL
+// ============================================
+
 let whatsappClient = null
 let qrCodeData = null
 let isConnected = false
 let isClientReady = false
-let isStoreReady = false
+let isInitializing = false
 let reconnectAttempts = 0
+let clientInfo = null
+
 const MAX_RECONNECT_ATTEMPTS = 5
+const VERSION = "2.5.0"
 
-const messageQueue = []
-let isProcessingQueue = false
+// ============================================
+// FUNÇÕES UTILITÁRIAS
+// ============================================
 
-// Não depende mais de window.Store que pode não estar exposto
-async function probeStoreReady(maxAttempts = 15, delayMs = 3000) {
-  console.log("[WhatsApp] ========================================")
-  console.log("[WhatsApp] Probing WhatsApp Store availability...")
-  console.log("[WhatsApp] Max attempts:", maxAttempts, "Delay:", delayMs + "ms")
-  console.log("[WhatsApp] ========================================")
+function log(level, ...args) {
+  const timestamp = new Date().toISOString()
+  const prefix = `[${timestamp}] [WhatsApp] [${level.toUpperCase()}]`
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      console.log(`[WhatsApp] Probe attempt ${attempt}/${maxAttempts}...`)
-
-      if (!whatsappClient || !isClientReady) {
-        console.log("[WhatsApp] Client not ready yet, waiting...")
-        await new Promise((r) => setTimeout(r, delayMs))
-        continue
-      }
-
-      // Tentar chamar getChats() com timeout curto para testar se o Store está pronto
-      const testPromise = whatsappClient.getChats()
-      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Probe timeout")), 10000))
-
-      const testChats = await Promise.race([testPromise, timeoutPromise])
-
-      // Se chegou aqui, getChats() funcionou!
-      console.log("[WhatsApp] ========================================")
-      console.log("[WhatsApp] STORE PROBE SUCCESSFUL!")
-      console.log("[WhatsApp] Found", testChats.length, "chats")
-      console.log("[WhatsApp] ========================================")
-
-      isStoreReady = true
-      return { ready: true, chatCount: testChats.length }
-    } catch (error) {
-      console.log(`[WhatsApp] Probe attempt ${attempt} failed:`, error.message)
-
-      // Se for erro de "Cannot read properties of undefined", o Store não está pronto
-      if (
-        error.message.includes("Cannot read properties") ||
-        error.message.includes("Store") ||
-        error.message.includes("Probe timeout")
-      ) {
-        console.log(`[WhatsApp] Store not ready yet, waiting ${delayMs}ms...`)
-        await new Promise((r) => setTimeout(r, delayMs))
-      } else {
-        // Outro tipo de erro, pode ser problema diferente
-        console.error(`[WhatsApp] Unexpected error during probe:`, error.message)
-        await new Promise((r) => setTimeout(r, delayMs))
-      }
-    }
+  if (level === "error") {
+    console.error(prefix, ...args)
+  } else {
+    console.log(prefix, ...args)
   }
-
-  console.log("[WhatsApp] ========================================")
-  console.log("[WhatsApp] WARNING: Store probe failed after all attempts")
-  console.log("[WhatsApp] ========================================")
-
-  return { ready: false, chatCount: 0 }
 }
 
-async function getChatsWithRetry(maxRetries = 5, initialDelay = 2000) {
-  let lastError = null
-
-  for (let retry = 0; retry < maxRetries; retry++) {
-    try {
-      const delay = initialDelay * Math.pow(1.5, retry)
-
-      if (retry > 0) {
-        console.log(`[WhatsApp] Retry ${retry}/${maxRetries} - waiting ${Math.round(delay)}ms...`)
-        await new Promise((r) => setTimeout(r, delay))
-      }
-
-      console.log(`[WhatsApp] Calling getChats() attempt ${retry + 1}/${maxRetries}...`)
-
-      // Timeout de 30 segundos para getChats
-      const getChatsPromise = whatsappClient.getChats()
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("getChats timeout after 30 seconds")), 30000),
-      )
-
-      const chats = await Promise.race([getChatsPromise, timeoutPromise])
-
-      console.log(`[WhatsApp] SUCCESS! Retrieved ${chats.length} chats`)
-      isStoreReady = true
-      return chats
-    } catch (error) {
-      lastError = error
-      console.error(`[WhatsApp] getChats attempt ${retry + 1} failed:`, error.message)
-
-      // Se for erro de Store, marcar como não pronto
-      if (error.message.includes("Cannot read properties of undefined") || error.message.includes("Store")) {
-        isStoreReady = false
-      }
-    }
-  }
-
-  throw lastError || new Error("Failed to get chats after all retries")
-}
-
-async function processMessageQueue() {
-  if (isProcessingQueue || messageQueue.length === 0) return
-
-  isProcessingQueue = true
-
-  while (messageQueue.length > 0) {
-    const { chatId, message, resolve, reject } = messageQueue.shift()
-
-    try {
-      const delay = Math.random() * 2000 + 1000
-      await new Promise((r) => setTimeout(r, delay))
-
-      const result = await whatsappClient.sendMessage(chatId, message)
-      resolve(result)
-    } catch (error) {
-      reject(error)
-    }
-  }
-
-  isProcessingQueue = false
-}
-
-function initializeWhatsApp() {
-  console.log("[WhatsApp] ========================================")
-  console.log("[WhatsApp] Starting WhatsApp client initialization...")
-  console.log("[WhatsApp] ========================================")
-
-  isStoreReady = false
-
+function findChromiumPath() {
   const possiblePaths = [
     "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
     "/usr/bin/google-chrome-stable",
     "/usr/bin/google-chrome",
-    "/usr/bin/chromium-browser",
     process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_PATH,
   ].filter(Boolean)
 
-  let chromiumPath = null
-
-  console.log("[WhatsApp] Searching for Chromium executable...")
-  for (const path of possiblePaths) {
-    console.log(`[WhatsApp]   Checking: ${path}`)
-    if (fs.existsSync(path)) {
-      chromiumPath = path
-      console.log(`[WhatsApp]   FOUND: ${chromiumPath}`)
-      break
+  for (const chromePath of possiblePaths) {
+    if (fs.existsSync(chromePath)) {
+      log("info", `Chromium found at: ${chromePath}`)
+      return chromePath
     }
   }
 
-  if (!chromiumPath) {
-    console.error("[WhatsApp] ========================================")
-    console.error("[WhatsApp] ERROR: Chromium not found!")
-    console.error("[WhatsApp] Checked paths:", possiblePaths)
-    console.error("[WhatsApp] ========================================")
-    throw new Error("Chromium executable not found")
+  log("error", "Chromium executable not found! Checked paths:", possiblePaths)
+  return null
+}
+
+async function updateDatabaseStatus(status) {
+  try {
+    const conn = await mysql.createConnection(dbConfig)
+    await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", [status])
+    await conn.end()
+    log("info", `Database status updated to: ${status}`)
+  } catch (error) {
+    log("error", "Error updating database status:", error.message)
+  }
+}
+
+function emitStatus() {
+  const status = {
+    connected: isConnected,
+    clientReady: isClientReady,
+    initializing: isInitializing,
+    qrCode: qrCodeData,
+    reconnectAttempts: reconnectAttempts,
+    clientInfo: clientInfo,
+    version: VERSION,
+    timestamp: new Date().toISOString(),
   }
 
-  console.log("[WhatsApp] ========================================")
-  console.log("[WhatsApp] Initializing WhatsApp Client...")
-  console.log(`[WhatsApp] Chromium: ${chromiumPath}`)
-  console.log("[WhatsApp] ========================================")
+  io.emit("status", status)
+  return status
+}
+
+// ============================================
+// FUNÇÃO PRINCIPAL: INICIALIZAR WHATSAPP
+// ============================================
+
+function initializeWhatsApp() {
+  if (isInitializing) {
+    log("warn", "Already initializing, skipping...")
+    return
+  }
+
+  log("info", "========================================")
+  log("info", "Starting WhatsApp client initialization")
+  log("info", `Version: ${VERSION}`)
+  log("info", "========================================")
+
+  isInitializing = true
+  isConnected = false
+  isClientReady = false
+  qrCodeData = null
+  clientInfo = null
+
+  emitStatus()
+
+  // Encontrar Chromium
+  const chromiumPath = findChromiumPath()
+  if (!chromiumPath) {
+    log("error", "Cannot start: Chromium not found")
+    isInitializing = false
+    io.emit("error", { message: "Chromium not found on server" })
+    return
+  }
+
+  // Limpar cliente anterior se existir
+  if (whatsappClient) {
+    log("info", "Destroying previous client...")
+    try {
+      whatsappClient.destroy()
+    } catch (e) {
+      log("warn", "Error destroying previous client:", e.message)
+    }
+    whatsappClient = null
+  }
+
+  // Criar novo cliente
+  log("info", "Creating new WhatsApp client...")
 
   whatsappClient = new Client({
     authStrategy: new LocalAuth({
@@ -223,14 +197,15 @@ function initializeWhatsApp() {
         "--disable-accelerated-2d-canvas",
         "--no-first-run",
         "--no-zygote",
+        "--single-process",
         "--disable-gpu",
         "--disable-extensions",
-        "--disable-background-timer-throttling",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-web-security",
-        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-software-rasterizer",
+        "--disable-features=site-per-process",
+        "--disable-features=IsolateOrigins",
+        "--disable-site-isolation-trials",
       ],
+      timeout: 120000,
     },
     webVersionCache: {
       type: "remote",
@@ -238,386 +213,503 @@ function initializeWhatsApp() {
     },
   })
 
+  // ============================================
+  // EVENTOS DO CLIENTE WHATSAPP
+  // ============================================
+
+  // QR Code recebido
   whatsappClient.on("qr", async (qr) => {
-    console.log("[WhatsApp] ========================================")
-    console.log("[WhatsApp] QR CODE RECEIVED!")
-    console.log("[WhatsApp] ========================================")
+    log("info", "========================================")
+    log("info", "QR CODE RECEIVED")
+    log("info", "========================================")
 
     try {
-      qrCodeData = await qrcode.toDataURL(qr)
-      console.log("[WhatsApp] QR Code converted to Data URL")
+      qrCodeData = await qrcode.toDataURL(qr, {
+        errorCorrectionLevel: "M",
+        margin: 2,
+        scale: 8,
+      })
 
       io.emit("qr", qrCodeData)
-      console.log("[WhatsApp] QR Code emitted via Socket.IO")
-      console.log("[WhatsApp] ========================================")
+      emitStatus()
+
+      log("info", "QR Code emitted to clients")
     } catch (error) {
-      console.error("[WhatsApp] ERROR generating QR code:", error)
+      log("error", "Error generating QR code:", error)
     }
   })
 
+  // Tela de carregamento
   whatsappClient.on("loading_screen", (percent, message) => {
-    console.log(`[WhatsApp] Loading: ${percent}% - ${message}`)
+    log("info", `Loading: ${percent}% - ${message}`)
     io.emit("loading", { percent, message })
   })
 
-  whatsappClient.on("authenticated", async () => {
-    console.log("[WhatsApp] ========================================")
-    console.log("[WhatsApp] AUTHENTICATED SUCCESSFULLY!")
-    console.log("[WhatsApp] ========================================")
+  // Autenticado
+  whatsappClient.on("authenticated", () => {
+    log("info", "========================================")
+    log("info", "AUTHENTICATED SUCCESSFULLY")
+    log("info", "========================================")
+
     reconnectAttempts = 0
+    qrCodeData = null
+
     io.emit("authenticated", { success: true })
+    emitStatus()
   })
 
+  // Falha na autenticação
+  whatsappClient.on("auth_failure", (msg) => {
+    log("error", "========================================")
+    log("error", "AUTHENTICATION FAILURE:", msg)
+    log("error", "========================================")
+
+    isConnected = false
+    isClientReady = false
+    isInitializing = false
+
+    io.emit("auth_failure", { message: msg })
+    emitStatus()
+
+    updateDatabaseStatus("auth_failure")
+  })
+
+  // Cliente pronto
   whatsappClient.on("ready", async () => {
-    console.log("[WhatsApp] ========================================")
-    console.log("[WhatsApp] WHATSAPP CLIENT IS READY!")
-    console.log("[WhatsApp] ========================================")
+    log("info", "========================================")
+    log("info", "WHATSAPP CLIENT IS READY!")
+    log("info", "========================================")
 
     isConnected = true
     isClientReady = true
+    isInitializing = false
     qrCodeData = null
 
-    io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
-
-    // O WhatsApp Web precisa de tempo para carregar todos os dados internos
-    console.log("[WhatsApp] Waiting 10 seconds for WhatsApp Web to fully load...")
-    await new Promise((r) => setTimeout(r, 10000))
-
-    console.log("[WhatsApp] Starting store probe...")
-
-    const probeResult = await probeStoreReady(20, 3000) // Até 60 segundos de espera total
-
-    if (probeResult.ready) {
-      console.log("[WhatsApp] ========================================")
-      console.log("[WhatsApp] STORE IS READY - Found", probeResult.chatCount, "chats")
-      console.log("[WhatsApp] ========================================")
-      io.emit("authenticated_ready", {
-        connected: true,
-        storeReady: true,
-        chatCount: probeResult.chatCount,
-        timestamp: new Date().toISOString(),
-      })
-      io.emit("store_ready", { ready: true, chatCount: probeResult.chatCount })
-    } else {
-      console.log("[WhatsApp] ========================================")
-      console.log("[WhatsApp] WARNING: Store probe failed")
-      console.log("[WhatsApp] Chats may load on first request")
-      console.log("[WhatsApp] ========================================")
-      io.emit("authenticated_ready", {
-        connected: true,
-        storeReady: false,
-        timestamp: new Date().toISOString(),
-      })
-    }
-
+    // Obter informações do cliente
     try {
-      const conn = await mysql.createConnection(dbConfig)
-      await conn.execute("UPDATE whatsapp_config SET status = ?, last_connected = NOW() WHERE id = 1", ["connected"])
-      await conn.end()
-      console.log("[WhatsApp] Database updated: CONNECTED")
-    } catch (error) {
-      console.error("[WhatsApp] Error updating database:", error)
+      const info = whatsappClient.info
+      clientInfo = {
+        pushname: info.pushname,
+        wid: info.wid._serialized,
+        platform: info.platform,
+      }
+      log("info", "Client info:", clientInfo)
+    } catch (e) {
+      log("warn", "Could not get client info:", e.message)
     }
 
-    console.log("[WhatsApp] ========================================")
-    console.log("[WhatsApp] CLIENT FULLY READY")
-    console.log("[WhatsApp] ========================================")
+    io.emit("ready", {
+      connected: true,
+      clientInfo: clientInfo,
+      timestamp: new Date().toISOString(),
+    })
+
+    emitStatus()
+    await updateDatabaseStatus("connected")
+
+    // Testar se consegue obter chats após um delay
+    log("info", "Waiting 5 seconds before testing chat access...")
+
+    setTimeout(async () => {
+      try {
+        log("info", "Testing chat access...")
+        const chats = await whatsappClient.getChats()
+        log("info", `SUCCESS! Can access ${chats.length} chats`)
+
+        io.emit("chats_ready", {
+          ready: true,
+          count: chats.length,
+        })
+      } catch (error) {
+        log("warn", "Initial chat test failed:", error.message)
+        log("info", "This is normal, chats will be available on request")
+      }
+    }, 5000)
+
+    log("info", "========================================")
+    log("info", "CLIENT FULLY INITIALIZED")
+    log("info", "========================================")
   })
 
-  whatsappClient.on("auth_failure", (msg) => {
-    console.error("[WhatsApp] Authentication FAILURE:", msg)
-    isConnected = false
-    isStoreReady = false
-    io.emit("auth_failure", { message: msg })
-  })
-
+  // Desconectado
   whatsappClient.on("disconnected", async (reason) => {
-    console.log("[WhatsApp] Disconnected:", reason)
+    log("warn", "========================================")
+    log("warn", "DISCONNECTED:", reason)
+    log("warn", "========================================")
+
     isConnected = false
     isClientReady = false
-    isStoreReady = false
+    isInitializing = false
     qrCodeData = null
+    clientInfo = null
+
     io.emit("disconnected", { reason })
+    emitStatus()
 
-    try {
-      const conn = await mysql.createConnection(dbConfig)
-      await conn.execute("UPDATE whatsapp_config SET status = ? WHERE id = 1", ["disconnected"])
-      await conn.end()
-    } catch (error) {
-      console.error("[WhatsApp] Error updating database:", error)
-    }
+    await updateDatabaseStatus("disconnected")
 
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && reason !== "LOGOUT") {
+    // Tentar reconectar se não foi logout manual
+    if (reason !== "LOGOUT" && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       reconnectAttempts++
-      const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000)
-      console.log(
-        `[WhatsApp] Attempting reconnection ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay / 1000}s...`,
-      )
+      const delay = Math.min(5000 * reconnectAttempts, 30000)
+
+      log("info", `Reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay / 1000}s...`)
 
       setTimeout(() => {
-        console.log("[WhatsApp] Reinitializing client...")
         initializeWhatsApp()
       }, delay)
     }
   })
 
+  // Mudança de estado
   whatsappClient.on("change_state", (state) => {
-    console.log("[WhatsApp] State changed:", state)
+    log("info", "State changed:", state)
+    io.emit("state_change", { state })
   })
 
+  // Nova mensagem recebida
   whatsappClient.on("message", async (message) => {
     try {
-      const conn = await mysql.createConnection(dbConfig)
       const contact = await message.getContact()
 
-      await conn.execute(
-        `INSERT INTO whatsapp_messages 
-                (chat_id, contact_name, contact_number, message_text, message_type, 
-                is_from_me, timestamp, media_url) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          message.from,
-          contact.pushname || contact.number,
-          contact.number,
-          message.body,
-          message.type,
-          message.fromMe ? 1 : 0,
-          new Date(message.timestamp * 1000),
-          message.hasMedia ? "pending" : null,
-        ],
-      )
-
-      io.emit("new_message", {
+      const messageData = {
         id: message.id._serialized,
         chatId: message.from,
-        contactName: contact.pushname || contact.number,
-        contactNumber: contact.number,
+        contactName: contact.pushname || contact.number || message.from,
+        contactNumber: contact.number || message.from.replace("@c.us", ""),
         message: message.body,
         type: message.type,
         fromMe: message.fromMe,
         timestamp: message.timestamp,
-      })
+        hasMedia: message.hasMedia,
+      }
 
-      await conn.end()
+      io.emit("new_message", messageData)
+      log("info", `New message from ${messageData.contactName}`)
+
+      // Salvar no banco
+      try {
+        const conn = await mysql.createConnection(dbConfig)
+        await conn.execute(
+          `INSERT INTO whatsapp_messages 
+                    (chat_id, contact_name, contact_number, message_text, message_type, 
+                    is_from_me, timestamp, media_url) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            message.from,
+            messageData.contactName,
+            messageData.contactNumber,
+            message.body,
+            message.type,
+            message.fromMe ? 1 : 0,
+            new Date(message.timestamp * 1000),
+            message.hasMedia ? "pending" : null,
+          ],
+        )
+        await conn.end()
+      } catch (dbError) {
+        log("error", "Error saving message to database:", dbError.message)
+      }
     } catch (error) {
-      console.error("[WhatsApp] Error handling message:", error)
+      log("error", "Error handling message:", error.message)
     }
   })
 
+  // Erro do cliente
   whatsappClient.on("error", (error) => {
-    console.error("[WhatsApp] ========================================")
-    console.error("[WhatsApp] CLIENT ERROR:")
-    console.error("[WhatsApp]", error.message)
-    console.error("[WhatsApp] ========================================")
+    log("error", "Client error:", error.message)
     io.emit("error", { message: error.message })
   })
 
-  console.log("[WhatsApp] Starting client initialization...")
-  whatsappClient.initialize().catch((err) => {
-    console.error("[WhatsApp] ========================================")
-    console.error("[WhatsApp] INITIALIZATION ERROR:")
-    console.error("[WhatsApp]", err.message)
-    console.error("[WhatsApp] ========================================")
-  })
+  // ============================================
+  // INICIALIZAR CLIENTE
+  // ============================================
+
+  log("info", "Calling whatsappClient.initialize()...")
+
+  whatsappClient
+    .initialize()
+    .then(() => {
+      log("info", "Client initialize() completed")
+    })
+    .catch((error) => {
+      log("error", "========================================")
+      log("error", "INITIALIZATION ERROR:", error.message)
+      log("error", "========================================")
+
+      isInitializing = false
+      io.emit("error", {
+        message: "Failed to initialize WhatsApp: " + error.message,
+      })
+      emitStatus()
+    })
 }
 
-// API Routes
+// ============================================
+// ROTAS DA API
+// ============================================
 
+// Health check
 app.get("/api/ping", (req, res) => {
   res.json({
     status: "alive",
+    version: VERSION,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
   })
 })
 
+// Status completo
 app.get("/api/status", (req, res) => {
   res.json({
+    success: true,
     connected: isConnected,
     clientReady: isClientReady,
-    storeReady: isStoreReady,
+    initializing: isInitializing,
     qrCode: qrCodeData,
+    clientInfo: clientInfo,
     reconnectAttempts: reconnectAttempts,
+    version: VERSION,
+    timestamp: new Date().toISOString(),
   })
 })
 
+// Conectar
 app.post("/api/connect", (req, res) => {
-  console.log("[WhatsApp] ========================================")
-  console.log("[WhatsApp] POST /api/connect received")
-  console.log("[WhatsApp] Current status - Connected:", isConnected)
-  console.log("[WhatsApp] ========================================")
+  log("info", "========================================")
+  log("info", "POST /api/connect received")
+  log("info", `Current state - Connected: ${isConnected}, Initializing: ${isInitializing}`)
+  log("info", "========================================")
 
-  if (!whatsappClient || !isConnected) {
+  if (isInitializing) {
+    return res.json({
+      success: false,
+      message: "Already initializing, please wait...",
+    })
+  }
+
+  if (isConnected && isClientReady) {
+    return res.json({
+      success: false,
+      message: "Already connected",
+    })
+  }
+
+  try {
     reconnectAttempts = 0
-    isStoreReady = false
-    console.log("[WhatsApp] Starting WhatsApp connection...")
-    try {
-      initializeWhatsApp()
-      res.json({ success: true, message: "Connecting to WhatsApp..." })
-    } catch (error) {
-      console.error("[WhatsApp] Error starting connection:", error)
-      res.json({ success: false, message: error.message })
-    }
-  } else {
-    console.log("[WhatsApp] Already connected!")
-    res.json({ success: false, message: "Already connected" })
+    initializeWhatsApp()
+
+    res.json({
+      success: true,
+      message: "Connecting to WhatsApp...",
+      version: VERSION,
+    })
+  } catch (error) {
+    log("error", "Error starting connection:", error)
+    res.json({
+      success: false,
+      message: error.message,
+    })
   }
 })
 
+// Desconectar
 app.post("/api/disconnect", async (req, res) => {
+  log("info", "POST /api/disconnect received")
+
   try {
     if (whatsappClient) {
+      await whatsappClient.logout()
       await whatsappClient.destroy()
-      whatsappClient = null
-      isConnected = false
-      isClientReady = false
-      isStoreReady = false
-      qrCodeData = null
-      reconnectAttempts = 0
-
-      const conn = await mysql.createConnection(dbConfig)
-      await conn.execute("UPDATE whatsapp_config SET status = ? WHERE id = 1", ["disconnected"])
-      await conn.end()
-
-      res.json({ success: true })
-    } else {
-      res.json({ success: false, message: "Not connected" })
     }
+
+    whatsappClient = null
+    isConnected = false
+    isClientReady = false
+    isInitializing = false
+    qrCodeData = null
+    clientInfo = null
+    reconnectAttempts = MAX_RECONNECT_ATTEMPTS // Prevenir reconexão automática
+
+    await updateDatabaseStatus("disconnected")
+
+    io.emit("disconnected", { reason: "LOGOUT" })
+    emitStatus()
+
+    res.json({ success: true, message: "Disconnected successfully" })
   } catch (error) {
-    console.error("[WhatsApp] Error disconnecting:", error)
-    res.json({ success: false, message: error.message })
+    log("error", "Error disconnecting:", error)
+
+    // Forçar reset do estado mesmo com erro
+    whatsappClient = null
+    isConnected = false
+    isClientReady = false
+    isInitializing = false
+    qrCodeData = null
+
+    res.json({
+      success: true,
+      message: "Disconnected (with cleanup)",
+    })
   }
 })
 
+// Obter conversas
 app.get("/api/chats", async (req, res) => {
-  console.log("[WhatsApp] ========================================")
-  console.log("[WhatsApp] GET /api/chats requested")
-  console.log("[WhatsApp] isConnected:", isConnected)
-  console.log("[WhatsApp] isClientReady:", isClientReady)
-  console.log("[WhatsApp] isStoreReady:", isStoreReady)
-  console.log("[WhatsApp] ========================================")
+  log("info", "========================================")
+  log("info", "GET /api/chats")
+  log("info", `State - Connected: ${isConnected}, Ready: ${isClientReady}`)
+  log("info", "========================================")
+
+  if (!whatsappClient) {
+    return res.json({
+      success: false,
+      message: "WhatsApp client not initialized",
+      chats: [],
+    })
+  }
+
+  if (!isConnected || !isClientReady) {
+    return res.json({
+      success: false,
+      message: "WhatsApp not ready. Please wait for connection.",
+      chats: [],
+    })
+  }
 
   try {
-    if (!isConnected || !whatsappClient) {
-      console.log("[WhatsApp] WhatsApp not connected")
-      return res.json({ success: false, message: "WhatsApp not connected" })
+    log("info", "Fetching chats...")
+
+    // Timeout de 60 segundos para getChats
+    const getChatsPromise = whatsappClient.getChats()
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Timeout getting chats")), 60000),
+    )
+
+    const chats = await Promise.race([getChatsPromise, timeoutPromise])
+
+    log("info", `Retrieved ${chats.length} chats, processing...`)
+
+    // Processar apenas os primeiros 50 chats
+    const processedChats = []
+    const chatsToProcess = chats.slice(0, 50)
+
+    for (const chat of chatsToProcess) {
+      try {
+        let contactName = chat.name
+
+        if (!contactName) {
+          try {
+            const contact = await chat.getContact()
+            contactName = contact.pushname || contact.number || chat.id.user
+          } catch {
+            contactName = chat.id.user || "Unknown"
+          }
+        }
+
+        processedChats.push({
+          id: chat.id._serialized,
+          name: contactName,
+          isGroup: chat.isGroup,
+          unreadCount: chat.unreadCount || 0,
+          timestamp: chat.timestamp || 0,
+          lastMessage: chat.lastMessage
+            ? {
+                body: chat.lastMessage.body || "",
+                timestamp: chat.lastMessage.timestamp || 0,
+                fromMe: chat.lastMessage.fromMe || false,
+              }
+            : null,
+        })
+      } catch (chatError) {
+        log("warn", `Error processing chat ${chat.id._serialized}:`, chatError.message)
+        // Adicionar mesmo com erro, com dados básicos
+        processedChats.push({
+          id: chat.id._serialized,
+          name: chat.name || chat.id.user || "Unknown",
+          isGroup: chat.isGroup || false,
+          unreadCount: 0,
+          timestamp: 0,
+          lastMessage: null,
+        })
+      }
     }
 
-    if (!isClientReady) {
-      console.log("[WhatsApp] Client not ready yet")
-      return res.json({ success: false, message: "WhatsApp is still initializing, please wait..." })
-    }
+    // Ordenar por timestamp (mais recentes primeiro)
+    processedChats.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
 
-    // Se o Store não está marcado como pronto, tentar mesmo assim
-    // pois o probe pode ter falhado mas o Store pode estar disponível agora
-    if (!isStoreReady) {
-      console.log("[WhatsApp] Store not marked as ready, will try getChats anyway...")
-    }
+    log("info", `Returning ${processedChats.length} processed chats`)
 
-    console.log("[WhatsApp] Fetching chats with retry mechanism...")
+    res.json({
+      success: true,
+      chats: processedChats,
+      total: chats.length,
+      processed: processedChats.length,
+    })
+  } catch (error) {
+    log("error", "========================================")
+    log("error", "ERROR fetching chats:", error.message)
+    log("error", "========================================")
 
-    let chats
-    try {
-      chats = await getChatsWithRetry(5, 2000)
-      console.log("[WhatsApp] Successfully retrieved", chats.length, "chats")
-    } catch (getChatsError) {
-      console.error("[WhatsApp] ========================================")
-      console.error("[WhatsApp] ERROR getting chats after all retries:")
-      console.error("[WhatsApp] Message:", getChatsError.message)
-      console.error("[WhatsApp] ========================================")
-
-      isStoreReady = false
-
+    // Verificar se é erro de Store não pronto
+    if (
+      error.message.includes("Cannot read properties") ||
+      error.message.includes("undefined") ||
+      error.message.includes("Timeout")
+    ) {
       return res.json({
         success: false,
-        message: "WhatsApp is still loading your conversations. Please wait 30-60 seconds and try again.",
-        error: getChatsError.message,
-        suggestion:
-          "This is normal after connecting. If it persists for more than 2 minutes, try disconnecting and reconnecting.",
+        message: "WhatsApp is still loading. Please wait 30-60 seconds and try again.",
+        error: error.message,
+        chats: [],
       })
     }
 
-    // Processar os chats
-    console.log("[WhatsApp] Processing", Math.min(chats.length, 50), "chats...")
-
-    const chatList = await Promise.all(
-      chats.slice(0, 50).map(async (chat) => {
-        try {
-          const contact = await chat.getContact()
-          const lastMessage = chat.lastMessage
-
-          return {
-            id: chat.id._serialized,
-            name: chat.name || contact.pushname || contact.number,
-            isGroup: chat.isGroup,
-            unreadCount: chat.unreadCount,
-            lastMessage: lastMessage
-              ? {
-                  body: lastMessage.body,
-                  timestamp: lastMessage.timestamp,
-                }
-              : null,
-          }
-        } catch (error) {
-          console.error("[WhatsApp] Error processing chat:", error.message)
-          return {
-            id: chat.id._serialized,
-            name: chat.name || chat.id.user || "Unknown",
-            isGroup: chat.isGroup,
-            unreadCount: chat.unreadCount || 0,
-            lastMessage: null,
-          }
-        }
-      }),
-    )
-
-    const filteredChats = chatList.filter((c) => c !== null)
-    console.log("[WhatsApp] Returning", filteredChats.length, "chats")
-    console.log("[WhatsApp] ========================================")
-
-    res.json({ success: true, chats: filteredChats, storeReady: true, total: chats.length })
-  } catch (error) {
-    console.error("[WhatsApp] ========================================")
-    console.error("[WhatsApp] UNEXPECTED ERROR in /api/chats:")
-    console.error("[WhatsApp] Message:", error.message)
-    console.error("[WhatsApp] Stack:", error.stack)
-    console.error("[WhatsApp] ========================================")
-    res.json({ success: false, message: error.message })
+    res.json({
+      success: false,
+      message: error.message,
+      chats: [],
+    })
   }
 })
 
-app.post("/api/check-store", async (req, res) => {
-  console.log("[WhatsApp] POST /api/check-store requested")
+// Obter mensagens de um chat
+app.get("/api/messages/:chatId", async (req, res) => {
+  const { chatId } = req.params
+  const limit = Number.parseInt(req.query.limit) || 50
+
+  log("info", `GET /api/messages/${chatId} (limit: ${limit})`)
 
   if (!whatsappClient || !isClientReady) {
-    return res.json({ success: false, message: "WhatsApp client not ready", storeReady: false })
-  }
-
-  try {
-    const probeResult = await probeStoreReady(5, 2000)
-    res.json({ success: true, storeReady: probeResult.ready, chatCount: probeResult.chatCount })
-  } catch (error) {
-    res.json({ success: false, message: error.message, storeReady: false })
-  }
-})
-
-app.get("/api/messages/:chatId", async (req, res) => {
-  try {
-    if (!isConnected || !whatsappClient) {
+    // Tentar buscar do banco de dados
+    try {
       const conn = await mysql.createConnection(dbConfig)
       const [messages] = await conn.execute(
         `SELECT * FROM whatsapp_messages 
-            WHERE chat_id = ? 
-            ORDER BY timestamp ASC 
-            LIMIT 100`,
-        [req.params.chatId],
+                WHERE chat_id = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ?`,
+        [chatId, limit],
       )
       await conn.end()
-      return res.json({ success: true, messages })
-    }
 
-    const chat = await whatsappClient.getChatById(req.params.chatId)
-    const messages = await chat.fetchMessages({ limit: 50 })
+      return res.json({
+        success: true,
+        messages: messages.reverse(),
+        source: "database",
+      })
+    } catch (dbError) {
+      return res.json({
+        success: false,
+        message: "WhatsApp not connected and database unavailable",
+        messages: [],
+      })
+    }
+  }
+
+  try {
+    const chat = await whatsappClient.getChatById(chatId)
+    const messages = await chat.fetchMessages({ limit })
 
     const messageList = messages.map((msg) => ({
       id: msg.id._serialized,
@@ -625,110 +717,203 @@ app.get("/api/messages/:chatId", async (req, res) => {
       fromMe: msg.fromMe,
       timestamp: msg.timestamp,
       type: msg.type,
+      hasMedia: msg.hasMedia,
     }))
 
-    res.json({ success: true, messages: messageList })
+    res.json({
+      success: true,
+      messages: messageList,
+      source: "whatsapp",
+    })
   } catch (error) {
-    console.error("[WhatsApp] Error fetching messages:", error)
-    res.json({ success: false, message: error.message })
+    log("error", "Error fetching messages:", error.message)
+    res.json({
+      success: false,
+      message: error.message,
+      messages: [],
+    })
   }
 })
 
+// Enviar mensagem
 app.post("/api/send", async (req, res) => {
-  try {
-    const { number, message } = req.body
+  const { number, message, chatId } = req.body
 
-    if (!isConnected || !whatsappClient) {
-      return res.json({ success: false, message: "WhatsApp not connected" })
+  log("info", `POST /api/send to ${number || chatId}`)
+
+  if (!whatsappClient || !isClientReady) {
+    return res.json({
+      success: false,
+      message: "WhatsApp not connected",
+    })
+  }
+
+  try {
+    let targetId = chatId
+
+    if (!targetId && number) {
+      // Formatar número
+      const cleanNumber = number.replace(/\D/g, "")
+      targetId = cleanNumber.includes("@") ? cleanNumber : `${cleanNumber}@c.us`
     }
 
-    const formattedNumber = number.includes("@c.us") ? number : `${number}@c.us`
-    const result = await whatsappClient.sendMessage(formattedNumber, message)
+    if (!targetId) {
+      return res.json({
+        success: false,
+        message: "No target number or chatId provided",
+      })
+    }
 
-    res.json({ success: true, messageId: result.id._serialized })
+    const result = await whatsappClient.sendMessage(targetId, message)
+
+    log("info", "Message sent successfully")
+
+    res.json({
+      success: true,
+      messageId: result.id._serialized,
+    })
   } catch (error) {
-    console.error("[WhatsApp] Error sending message:", error)
-    res.json({ success: false, message: error.message })
+    log("error", "Error sending message:", error.message)
+    res.json({
+      success: false,
+      message: error.message,
+    })
   }
 })
 
+// Enviar mídia
 app.post("/api/send-media", async (req, res) => {
-  try {
-    const { number, mediaUrl, caption, mimetype } = req.body
+  const { number, chatId, mediaUrl, caption, mimetype } = req.body
 
-    if (!isConnected || !whatsappClient) {
-      return res.json({ success: false, message: "WhatsApp not connected" })
+  log("info", `POST /api/send-media to ${number || chatId}`)
+
+  if (!whatsappClient || !isClientReady) {
+    return res.json({
+      success: false,
+      message: "WhatsApp not connected",
+    })
+  }
+
+  try {
+    let targetId = chatId
+
+    if (!targetId && number) {
+      const cleanNumber = number.replace(/\D/g, "")
+      targetId = cleanNumber.includes("@") ? cleanNumber : `${cleanNumber}@c.us`
     }
 
-    const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true })
-    if (mimetype) media.mimetype = mimetype
+    const media = await MessageMedia.fromUrl(mediaUrl, {
+      unsafeMime: true,
+    })
 
-    const formattedNumber = number.includes("@c.us") ? number : `${number}@c.us`
-    const result = await whatsappClient.sendMessage(formattedNumber, media, { caption })
+    if (mimetype) {
+      media.mimetype = mimetype
+    }
 
-    res.json({ success: true, messageId: result.id._serialized })
+    const result = await whatsappClient.sendMessage(targetId, media, {
+      caption: caption || "",
+    })
+
+    res.json({
+      success: true,
+      messageId: result.id._serialized,
+    })
   } catch (error) {
-    console.error("[WhatsApp] Error sending media:", error)
-    res.json({ success: false, message: error.message })
+    log("error", "Error sending media:", error.message)
+    res.json({
+      success: false,
+      message: error.message,
+    })
   }
 })
 
-// Socket.IO connection handling
-io.on("connection", (socket) => {
-  console.log("[Socket.IO] Client connected:", socket.id)
+// ============================================
+// SOCKET.IO
+// ============================================
 
-  // Enviar status atual imediatamente
+io.on("connection", (socket) => {
+  log("info", `Socket connected: ${socket.id}`)
+
+  // Enviar status atual
   socket.emit("status", {
     connected: isConnected,
     clientReady: isClientReady,
-    storeReady: isStoreReady,
+    initializing: isInitializing,
     qrCode: qrCodeData,
+    clientInfo: clientInfo,
+    version: VERSION,
   })
 
+  // Se tiver QR code disponível, enviar
   if (qrCodeData && !isConnected) {
     socket.emit("qr", qrCodeData)
   }
 
-  socket.on("disconnect", () => {
-    console.log("[Socket.IO] Client disconnected:", socket.id)
+  socket.on("request_status", () => {
+    emitStatus()
   })
 
-  socket.on("request_status", () => {
-    socket.emit("status", {
-      connected: isConnected,
-      clientReady: isClientReady,
-      storeReady: isStoreReady,
-      qrCode: qrCodeData,
-    })
+  socket.on("disconnect", () => {
+    log("info", `Socket disconnected: ${socket.id}`)
   })
 })
 
-// Start server
+// ============================================
+// INICIALIZAÇÃO DO SERVIDOR
+// ============================================
+
 const PORT = process.env.PORT || 3000
 
 server.listen(PORT, () => {
+  console.log("")
   console.log("==================================================")
+  console.log(`  EyesCloud WhatsApp API v${VERSION}`)
   console.log("==================================================")
-  console.log(`[Server] EyesCloud WhatsApp API v2.2.0`)
-  console.log(`[Server] Running on port ${PORT}`)
-  console.log(`[Server] Environment: ${process.env.NODE_ENV || "development"}`)
+  console.log(`  Port: ${PORT}`)
+  console.log(`  Environment: ${process.env.NODE_ENV || "development"}`)
+  console.log(`  Time: ${new Date().toISOString()}`)
   console.log("==================================================")
-  console.log("==================================================")
+  console.log("")
 })
 
-// Graceful shutdown
-process.on("SIGINT", async () => {
-  console.log("[Server] Shutting down gracefully...")
+// ============================================
+// GRACEFUL SHUTDOWN
+// ============================================
+
+async function gracefulShutdown(signal) {
+  log("info", `${signal} received, shutting down...`)
+
   if (whatsappClient) {
-    await whatsappClient.destroy()
+    try {
+      await whatsappClient.destroy()
+      log("info", "WhatsApp client destroyed")
+    } catch (e) {
+      log("warn", "Error destroying client:", e.message)
+    }
   }
-  process.exit(0)
+
+  server.close(() => {
+    log("info", "Server closed")
+    process.exit(0)
+  })
+
+  // Forçar saída após 10 segundos
+  setTimeout(() => {
+    log("warn", "Forcing shutdown...")
+    process.exit(1)
+  }, 10000)
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"))
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
+
+// Capturar erros não tratados
+process.on("uncaughtException", (error) => {
+  log("error", "Uncaught exception:", error.message)
+  log("error", error.stack)
 })
 
-process.on("SIGTERM", async () => {
-  console.log("[Server] SIGTERM received, shutting down...")
-  if (whatsappClient) {
-    await whatsappClient.destroy()
-  }
-  process.exit(0)
+process.on("unhandledRejection", (reason, promise) => {
+  log("error", "Unhandled rejection at:", promise)
+  log("error", "Reason:", reason)
 })
