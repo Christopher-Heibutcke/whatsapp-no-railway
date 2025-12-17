@@ -178,9 +178,17 @@ function initializeWhatsApp() {
 
     qrCodeData = null
 
-    console.log("[v0] Waiting 15 seconds for WhatsApp Store to fully load...")
+    isConnected = true
+
+    io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
+    io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
+
+    console.log("[v0] ========================================")
+    console.log("[v0] Events emitted - Frontend notified")
+    console.log("[v0] Waiting 3 seconds for WhatsApp Store to fully load...")
+    console.log("[v0] ========================================")
+
     setTimeout(async () => {
-      isConnected = true
       isClientReady = true
 
       console.log("[v0] ========================================")
@@ -188,9 +196,6 @@ function initializeWhatsApp() {
       console.log("[v0] isConnected:", isConnected)
       console.log("[v0] isClientReady:", isClientReady)
       console.log("[v0] ========================================")
-
-      io.emit("ready", { connected: true, timestamp: new Date().toISOString() })
-      io.emit("authenticated_ready", { connected: true, timestamp: new Date().toISOString() })
 
       try {
         const conn = await mysql.createConnection(dbConfig)
@@ -200,7 +205,7 @@ function initializeWhatsApp() {
       } catch (error) {
         console.error("[v0] Error updating database:", error)
       }
-    }, 15000) // Aumentado para 15 segundos
+    }, 3000) // Reduzido de 15 para 3 segundos
   })
 
   whatsappClient.on("auth_failure", (msg) => {
