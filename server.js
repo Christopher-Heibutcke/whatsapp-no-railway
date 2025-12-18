@@ -1,11 +1,15 @@
 /**
- * EyesCloud WhatsApp Backend v2.6.0
+ * EyesCloud WhatsApp Backend v2.7.0
  * Servidor completo para integração WhatsApp Web
  *
  * CORREÇÕES:
  * - Fotos de perfil com tratamento de erro robusto
  * - Atualização em tempo real via Socket.IO
  * - Remoção de chamadas que causam erro no Store
+ * - Gestão de sessão para evitar falhas
+ * - Filas de requisição para evitar sobrecarga
+ * - Melhor tratamento de fotos de perfil
+ * - Reconexão em caso de fechamento de sessão
  */
 
 const express = require("express")
@@ -56,12 +60,14 @@ let isClientReady = false
 let isInitializing = false
 let reconnectAttempts = 0
 let clientInfo = null
+let isProcessingRequest = false
+let requestQueue = []
 
 const profilePicCache = new Map()
 const CACHE_DURATION = 30 * 60 * 1000 // 30 minutos
 
 const MAX_RECONNECT_ATTEMPTS = 5
-const VERSION = "2.6.0"
+const VERSION = "2.7.0"
 
 // ============================================
 // FUNÇÕES UTILITÁRIAS
@@ -99,34 +105,47 @@ function findChromiumPath() {
   return null
 }
 
-async function getProfilePicSafe(target) {
-  if (!target || !whatsappClient || !isClientReady) return null
+async function processQueue() {
+  if (isProcessingRequest || requestQueue.length === 0) return
 
-  const targetId = typeof target === "string" ? target : target.id?._serialized
-  if (!targetId) return null
+  isProcessingRequest = true
+  const { fn, resolve, reject } = requestQueue.shift()
 
-  // Check cache first
+  try {
+    const result = await fn()
+    resolve(result)
+  } catch (error) {
+    reject(error)
+  } finally {
+    isProcessingRequest = false
+    setTimeout(processQueue, 100)
+  }
+}
+
+function queueRequest(fn) {
+  return new Promise((resolve, reject) => {
+    requestQueue.push({ fn, resolve, reject })
+    processQueue()
+  })
+}
+
+async function getProfilePicSafe(targetId) {
+  if (!targetId || !whatsappClient || !isClientReady) return null
+
   const cached = profilePicCache.get(targetId)
   if (cached && Date.now() - cached.time < CACHE_DURATION) {
     return cached.url
   }
 
   try {
-    let picUrl = null
+    const picUrl = await Promise.race([
+      whatsappClient.getProfilePicUrl(targetId),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 5000)),
+    ])
 
-    // Try to get profile pic directly from client
-    if (whatsappClient.getProfilePicUrl) {
-      picUrl = await Promise.race([
-        whatsappClient.getProfilePicUrl(targetId),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 5000)),
-      ])
-    }
-
-    // Cache the result (even if null)
-    profilePicCache.set(targetId, { url: picUrl, time: Date.now() })
-    return picUrl
+    profilePicCache.set(targetId, { url: picUrl || null, time: Date.now() })
+    return picUrl || null
   } catch (error) {
-    // Cache null to avoid repeated failed attempts
     profilePicCache.set(targetId, { url: null, time: Date.now() })
     return null
   }
@@ -148,6 +167,30 @@ function emitStatus() {
   return status
 }
 
+function isClientHealthy() {
+  return whatsappClient && isConnected && isClientReady
+}
+
+async function handleSessionError(error) {
+  log("error", "Session error detected:", error.message)
+
+  if (error.message.includes("Session closed") || error.message.includes("Protocol error")) {
+    log("warn", "Session closed, attempting recovery...")
+
+    isConnected = false
+    isClientReady = false
+
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      reconnectAttempts++
+      log("info", `Reconnecting attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}...`)
+
+      setTimeout(() => {
+        initializeWhatsApp()
+      }, 5000)
+    }
+  }
+}
+
 // ============================================
 // FUNÇÃO PRINCIPAL: INICIALIZAR WHATSAPP
 // ============================================
@@ -159,8 +202,7 @@ function initializeWhatsApp() {
   }
 
   log("info", "========================================")
-  log("info", "Starting WhatsApp client initialization")
-  log("info", `Version: ${VERSION}`)
+  log("info", `Starting WhatsApp client v${VERSION}`)
   log("info", "========================================")
 
   isInitializing = true
@@ -168,8 +210,7 @@ function initializeWhatsApp() {
   isClientReady = false
   qrCodeData = null
   clientInfo = null
-
-  // Clear profile pic cache on reconnect
+  requestQueue = []
   profilePicCache.clear()
 
   emitStatus()
@@ -324,7 +365,7 @@ function initializeWhatsApp() {
       } catch (error) {
         log("warn", "Initial chat test failed:", error.message)
       }
-    }, 5000)
+    }, 3000)
 
     log("info", "========================================")
     log("info", "CLIENT FULLY INITIALIZED")
@@ -355,11 +396,6 @@ function initializeWhatsApp() {
         initializeWhatsApp()
       }, delay)
     }
-  })
-
-  whatsappClient.on("change_state", (state) => {
-    log("info", "State changed:", state)
-    io.emit("state_change", { state })
   })
 
   whatsappClient.on("message", async (message) => {
@@ -420,7 +456,7 @@ function initializeWhatsApp() {
 
   whatsappClient.on("error", (error) => {
     log("error", "Client error:", error.message)
-    io.emit("error", { message: error.message })
+    handleSessionError(error)
   })
 
   log("info", "Calling whatsappClient.initialize()...")
@@ -550,18 +586,10 @@ app.get("/api/chats", async (req, res) => {
   log("info", `State - Connected: ${isConnected}, Ready: ${isClientReady}`)
   log("info", "========================================")
 
-  if (!whatsappClient) {
+  if (!isClientHealthy()) {
     return res.json({
       success: false,
       message: "WhatsApp client not initialized",
-      chats: [],
-    })
-  }
-
-  if (!isConnected || !isClientReady) {
-    return res.json({
-      success: false,
-      message: "WhatsApp not ready. Please wait for connection.",
       chats: [],
     })
   }
@@ -639,6 +667,7 @@ app.get("/api/chats", async (req, res) => {
     })
   } catch (error) {
     log("error", "Error in /api/chats:", error.message)
+    handleSessionError(error)
     res.json({
       success: false,
       message: error.message,
@@ -653,7 +682,7 @@ app.get("/api/messages/:chatId", async (req, res) => {
 
   log("info", `GET /api/messages/${chatId}`)
 
-  if (!whatsappClient || !isClientReady) {
+  if (!isClientHealthy()) {
     return res.json({
       success: false,
       message: "WhatsApp not ready",
@@ -705,6 +734,7 @@ app.get("/api/messages/:chatId", async (req, res) => {
     })
   } catch (error) {
     log("error", `Error fetching messages for ${chatId}:`, error.message)
+    handleSessionError(error)
     res.json({
       success: false,
       message: error.message,
@@ -716,7 +746,7 @@ app.get("/api/messages/:chatId", async (req, res) => {
 app.get("/api/profile-pic/:chatId", async (req, res) => {
   const { chatId } = req.params
 
-  if (!whatsappClient || !isClientReady) {
+  if (!isClientHealthy()) {
     return res.json({ success: false, url: null })
   }
 
@@ -733,7 +763,7 @@ app.post("/api/send", async (req, res) => {
 
   log("info", `POST /api/send to ${chatId}`)
 
-  if (!whatsappClient || !isClientReady) {
+  if (!isClientHealthy()) {
     return res.json({
       success: false,
       message: "WhatsApp not ready",
@@ -748,15 +778,16 @@ app.post("/api/send", async (req, res) => {
   }
 
   try {
-    await whatsappClient.sendMessage(chatId, message)
+    const result = await whatsappClient.sendMessage(chatId, message)
     log("info", "Message sent successfully")
 
     res.json({
       success: true,
-      message: "Message sent",
+      messageId: result.id._serialized,
     })
   } catch (error) {
     log("error", "Error sending message:", error.message)
+    handleSessionError(error)
     res.json({
       success: false,
       message: error.message,
@@ -769,7 +800,7 @@ app.post("/api/send-media", async (req, res) => {
 
   log("info", `POST /api/send-media to ${chatId}`)
 
-  if (!whatsappClient || !isClientReady) {
+  if (!isClientHealthy()) {
     return res.json({
       success: false,
       message: "WhatsApp not ready",
@@ -788,7 +819,7 @@ app.post("/api/send-media", async (req, res) => {
     const base64Data = media.split(",")[1] || media
     const mediaMessage = new MessageMedia(mimetype || "image/jpeg", base64Data, filename || "file")
 
-    await whatsappClient.sendMessage(chatId, mediaMessage, {
+    const result = await whatsappClient.sendMessage(chatId, mediaMessage, {
       caption: caption || "",
     })
 
@@ -796,10 +827,11 @@ app.post("/api/send-media", async (req, res) => {
 
     res.json({
       success: true,
-      message: "Media sent",
+      messageId: result.id._serialized,
     })
   } catch (error) {
     log("error", "Error sending media:", error.message)
+    handleSessionError(error)
     res.json({
       success: false,
       message: error.message,
@@ -858,21 +890,10 @@ io.on("connection", (socket) => {
   log("info", `Socket connected: ${socket.id}`)
 
   // Send current status immediately on connection
-  socket.emit("status", {
-    connected: isConnected,
-    clientReady: isClientReady,
-    initializing: isInitializing,
-    qrCode: qrCodeData,
-    clientInfo: clientInfo,
-    version: VERSION,
-  })
+  socket.emit("status", emitStatus())
 
   socket.on("disconnect", () => {
     log("info", `Socket disconnected: ${socket.id}`)
-  })
-
-  socket.on("get_status", () => {
-    emitStatus()
   })
 })
 
