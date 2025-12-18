@@ -839,6 +839,76 @@ app.post("/api/send-media", async (req, res) => {
   }
 })
 
+app.post("/api/check-number", async (req, res) => {
+  const { number } = req.body
+
+  log("info", `POST /api/check-number for ${number}`)
+
+  if (!isClientHealthy()) {
+    return res.json({
+      success: false,
+      message: "WhatsApp not ready",
+    })
+  }
+
+  if (!number) {
+    return res.json({
+      success: false,
+      message: "Number is required",
+    })
+  }
+
+  try {
+    // Formatar o número (remover caracteres especiais e adicionar @c.us)
+    let formattedNumber = number.replace(/\D/g, "")
+
+    // Se não começar com código do país, adicionar 55 (Brasil)
+    if (!formattedNumber.startsWith("55") && formattedNumber.length <= 11) {
+      formattedNumber = "55" + formattedNumber
+    }
+
+    const chatId = formattedNumber + "@c.us"
+
+    // Verificar se o número está registrado no WhatsApp
+    const isRegistered = await whatsappClient.isRegisteredUser(chatId)
+
+    if (isRegistered) {
+      // Tentar obter informações do contato
+      let contactName = formattedNumber
+      let profilePic = null
+
+      try {
+        const contact = await whatsappClient.getContactById(chatId)
+        contactName = contact.pushname || contact.name || formattedNumber
+        profilePic = await getProfilePicSafe(chatId)
+      } catch (e) {
+        log("warn", "Could not get contact info:", e.message)
+      }
+
+      res.json({
+        success: true,
+        registered: true,
+        chatId: chatId,
+        number: formattedNumber,
+        name: contactName,
+        profilePic: profilePic,
+      })
+    } else {
+      res.json({
+        success: true,
+        registered: false,
+        message: "Este número não possui WhatsApp",
+      })
+    }
+  } catch (error) {
+    log("error", "Error checking number:", error.message)
+    res.json({
+      success: false,
+      message: error.message,
+    })
+  }
+})
+
 app.get("/api/quick-replies", async (req, res) => {
   log("info", "GET /api/quick-replies")
 
